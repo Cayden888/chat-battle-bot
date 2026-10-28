@@ -448,7 +448,9 @@ async def job_weekly_report(context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(config.BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler(["points", "score", "分数"], cmd_points))
+    app.add_handler(CommandHandler(["points", "score"], cmd_points))
+    # 中文也能查分：直接打「分数」「积分」「查分」
+    app.add_handler(MessageHandler(filters.Regex(r"^\s*(分数|积分|查分|我的分数|我的积分)\s*$"), cmd_points))
     app.add_handler(CommandHandler(["top", "rank"], cmd_top))
     app.add_handler(CommandHandler(["rules", "start", "help"], cmd_rules))
     app.add_handler(CommandHandler("dq", cmd_dq))
