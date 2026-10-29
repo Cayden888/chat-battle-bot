@@ -6,6 +6,7 @@ import csv
 import html
 import io
 import logging
+import re
 import time as _time
 from datetime import datetime, timedelta
 
@@ -96,18 +97,31 @@ def _delete_seconds(kind: str) -> int:
     return {
         "congrats": config.CONGRATS_DELETE_SEC,
         "warning": config.WARNING_DELETE_SEC,
+        "keep": 0,
     }.get(kind, config.REPLY_DELETE_SEC)
 
 
+# 玩家用来叫 Bot 的中文关键字（和指令一样，会被一起自动删除）
+TEXT_TRIGGERS = re.compile(r"^\s*(分数|积分|查分|我的分数|我的积分|任务|今日任务|我的任务)\s*$")
+
+
+def _is_trigger(text: str | None) -> bool:
+    return bool(text) and (text.startswith("/") or bool(TEXT_TRIGGERS.match(text)))
+
+
 async def reply(context, msg: Message, text: str, kind: str = "reply", **kw):
-    """所有群里的回复都走这里。kind: congrats / warning / reply"""
+    """所有群里的回复都走这里。
+    kind: congrats（恭喜）/ reply（一般指令）/ warning（违规、dq、undq）/ keep（/topX /rulesX，不删）"""
     m = await msg.reply_text(text, **kw)
+    if m.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not context.job_queue:
+        return m
     secs = _delete_seconds(kind)
-    if secs > 0 and m.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and context.job_queue:
-        ids = [m.message_id]
-        if kind == "reply" and config.DELETE_COMMAND_MSG and (msg.text or "").startswith("/"):
-            ids.append(msg.message_id)
-        context.job_queue.run_once(_delete_job, secs, data=(m.chat_id, ids))
+    if secs > 0:
+        context.job_queue.run_once(_delete_job, secs, data=(m.chat_id, [m.message_id]))
+    # 玩家 / 审核人员打的指令本身（/points、分数、/topX…）也删掉，保持群干净
+    if (config.DELETE_COMMAND_MSG and kind in ("reply", "keep") and _is_trigger(msg.text)
+            and config.REPLY_DELETE_SEC > 0):
+        context.job_queue.run_once(_delete_job, config.REPLY_DELETE_SEC, data=(msg.chat_id, [msg.message_id]))
     return m
 
 
@@ -149,13 +163,15 @@ async def flag_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, kin
         log.exception("flag failed: %s", e)
         warn_count, history, stats = 1, 0, {}
 
-    # 1) 群警告
+    # 1) 群警告（记住这条警告的位置，审核人员按「忽略」时会把它删掉）
+    warn_ref = ""
     try:
-        await reply(context, msg,
+        wm = await reply(context, msg,
             f"⚠️ {name} 请勿在群内{label}。\n"
             f"这违反了【终极聊天争霸赛】规则，已提交管理员审核，"
             f"可能会被取消本期活动资格。（本期第 {warn_count} 次警告）",
             kind="warning", parse_mode=ParseMode.HTML)
+        warn_ref = f":{wm.chat_id}:{wm.message_id}"
     except Exception as e:
         log.warning("group warning failed: %s", e)
 
@@ -178,8 +194,8 @@ async def flag_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, kin
         + (f'\n📎 <a href="{link}">查看原消息</a>' if link else "")
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("❌ 取消本期资格", callback_data=f"dq:{event:%Y%m%d}:{user.id}"),
-        InlineKeyboardButton("✅ 忽略", callback_data=f"ok:{event:%Y%m%d}:{user.id}"),
+        InlineKeyboardButton("❌ 取消本期资格", callback_data=f"dq:{event:%Y%m%d}:{user.id}{warn_ref}"),
+        InlineKeyboardButton("✅ 忽略", callback_data=f"ok:{event:%Y%m%d}:{user.id}{warn_ref}"),
     ]])
     targets = list(config.REVIEWER_IDS) + ([config.LOG_CHAT_ID] if config.LOG_CHAT_ID else [])
     for t in targets:
@@ -196,9 +212,11 @@ async def on_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if reviewer.id not in config.REVIEWER_IDS | config.ADMIN_IDS:
         return await q.answer("只有审核人员可以操作", show_alert=True)
     try:
-        action, ev, uid = q.data.split(":")
+        parts = q.data.split(":")
+        action, ev, uid = parts[0], parts[1], int(parts[2])
         event = datetime.strptime(ev, "%Y%m%d").date()
-        uid = int(uid)
+        # 群警告的位置（旧的报告按钮没有这个资料）
+        warn_chat, warn_msg = (int(parts[3]), int(parts[4])) if len(parts) >= 5 else (None, None)
     except Exception:
         return await q.answer("按钮数据错误", show_alert=True)
 
@@ -209,6 +227,14 @@ async def on_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("已取消资格")
     else:
         result = f"\n\n✅ <b>已忽略</b> — {html.escape(who)}"
+        # 忽略 = 不算违规，把群里那条 ⚠️ 警告删掉
+        if warn_chat and warn_msg:
+            try:
+                await context.bot.delete_message(warn_chat, warn_msg)
+                result += "\n🗑 群里的警告已删除"
+            except Exception as e:
+                log.warning("delete warning failed: %s", e)
+                result += "\n⚠️ 群里的警告删不掉（可能已被删除，或超过 48 小时），请手动删除"
         await q.answer("已忽略")
     try:
         await q.edit_message_text(q.message.text_html + result, parse_mode=ParseMode.HTML,
@@ -335,7 +361,7 @@ async def cmd_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(context, msg, format_stats(user, s), parse_mode=ParseMode.HTML)
 
 
-async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str = "reply"):
     msg = update.effective_message
     rows = await db.leaderboard(config.current_event(), 10)
     if not rows:
@@ -345,7 +371,7 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         body = "\n".join(f"{medals.get(r['rank'], str(r['rank']) + '.')} {display_name(r)} — {r['points']} 分"
                          for r in rows)
         text = f"🏆 <b>终极聊天争霸赛 · 实时 Top 10</b>\n\n{body}\n\n输入 /points 查看自己的分数"
-    await reply(context, msg, text, parse_mode=ParseMode.HTML)
+    await reply(context, msg, text, kind=kind, parse_mode=ParseMode.HTML)
 
 
 RULES = (
@@ -365,16 +391,27 @@ RULES = (
 )
 
 
-async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply(context, update.effective_message, 
+async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str = "reply"):
+    await reply(context, update.effective_message,
         RULES.format(roll=config.ROLLOVER_TIME.strftime("%H:%M"), rep=config.REPORT_TIME.strftime("%H:%M"),
                      n=config.TOP_N, prize=config.PRIZE_TEXT, turn=config.TURNOVER_REQ),
-        parse_mode=ParseMode.HTML)
+        kind=kind, parse_mode=ParseMode.HTML)
+
+
+# /topX /rulesX：只有审核人员 / 管理员能用，Bot 的回复会一直留在群里（不自动删除）
+async def cmd_top_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _require_admin(update, context):
+        await cmd_top(update, context, kind="keep")
+
+
+async def cmd_rules_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _require_admin(update, context):
+        await cmd_rules(update, context, kind="keep")
 
 
 async def _require_admin(update: Update, context) -> bool:
     if not await is_admin(context, update.effective_chat.id, update.effective_user.id):
-        await reply(context, update.effective_message, "只有管理员可以使用这个指令。")
+        await reply(context, update.effective_message, "只有审核人员 / 管理员可以使用这个指令。")
         return False
     return True
 
@@ -503,6 +540,13 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  f"\n   这个群: <code>{chat.id}</code>（{chat.type}）"
                  f"\n   GROUP_IDS: <code>{','.join(map(str, config.GROUP_IDS)) or '(空=全部群)'}</code>"
                  + ("" if in_group else f"\n   → Railway 把 GROUP_IDS 改成 {chat.id}"))
+    try:
+        bm = await context.bot.get_chat_member(chat.id, me.id)
+        can_del = bm.status == "administrator" and bool(getattr(bm, "can_delete_messages", False))
+    except Exception:
+        can_del = False
+    lines.append(f"{'✅' if can_del else '⚠️'} Bot 有「删除消息」权限"
+                 + ("" if can_del else "（自动删除玩家打的 /points 等指令需要这个权限；Bot 自己的回复不需要）"))
     admin = await is_admin(context, chat.id, user.id)
     lines.append(f"{'⚠️ 你是管理员（不计分）' if admin else '✅ 你不是管理员（会计分）'}  <code>{user.id}</code>")
     try:
@@ -587,6 +631,8 @@ def main():
     # 中文也能查分：直接打「分数」「积分」「查分」
     app.add_handler(MessageHandler(filters.Regex(r"^\s*(分数|积分|查分|我的分数|我的积分)\s*$"), cmd_points))
     app.add_handler(CommandHandler(["top", "rank"], cmd_top))
+    app.add_handler(CommandHandler("topx", cmd_top_keep))      # /topX（大小写都可以）
+    app.add_handler(CommandHandler("rulesx", cmd_rules_keep))  # /rulesX
     app.add_handler(CommandHandler(["rules", "start", "help"], cmd_rules))
     app.add_handler(CommandHandler("dq", cmd_dq))
     app.add_handler(CallbackQueryHandler(on_review_button, pattern=r"^(dq|ok):"))

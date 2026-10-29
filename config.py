@@ -43,8 +43,8 @@ QR_CHECK = os.getenv("QR_CHECK", "1") == "1"
 CONGRATS_DELETE_SEC = int(os.getenv("CONGRATS_DELETE_SEC", "30"))   # 恭喜完成 5条 / 10条任务
 REPLY_DELETE_SEC = int(os.getenv("REPLY_DELETE_SEC", "20"))         # /points /quest /top /rules /id /debug 等指令的回复
 WARNING_DELETE_SEC = int(os.getenv("WARNING_DELETE_SEC", "0"))      # 违规警告 + /dq /undq 结果（默认 0 = 保留，方便之后回复他 unban）
-DELETE_COMMAND_MSG = os.getenv("DELETE_COMMAND_MSG", "0") == "1"    # 1 = 连玩家打的 /points 等指令一起删（Bot 需要管理员「删除消息」权限）
-# 不会自动删除：周一赢家公告、客服群名单、私讯给审核人员的报告、私聊 Bot 的回复
+DELETE_COMMAND_MSG = os.getenv("DELETE_COMMAND_MSG", "1") == "1"    # 1 = 玩家打的 /points、分数 等指令也在 REPLY_DELETE_SEC 后删掉（Bot 需要管理员「删除消息」权限）；0 = 不删
+# 不会自动删除：/topX /rulesX 的回复、周一赢家公告、客服群名单、私讯给审核人员的报告、私聊 Bot 的回复
 
 
 def now() -> datetime:
