@@ -38,6 +38,8 @@ MIN_INTERVAL_SEC = int(os.getenv("MIN_INTERVAL_SEC", "3"))   # 两条有效发�
 NEWBIE_THRESHOLD = int(os.getenv("NEWBIE_THRESHOLD", "5"))   # 历史有效发言 < 这个数 + 发Link = 报告里标注「疑似钓鱼」
 QR_CHECK = os.getenv("QR_CHECK", "1") == "1"
 
+ANNOUNCE_EVENT_SWITCH = os.getenv("ANNOUNCE_EVENT_SWITCH", "1") == "1"   # /eventstart /eventend 时在活动群发公告（0 = 不发）
+
 # ===== 自动删除 Bot 在群里的回复（秒；0 = 不删除）=====
 # 以后要改时间：去 Railway → Variables 改这几个值，不用改代码
 CONGRATS_DELETE_SEC = int(os.getenv("CONGRATS_DELETE_SEC", "30"))   # 恭喜完成 5条 / 10条任务

@@ -1,6 +1,6 @@
 """Supabase 调用（全部通过 schema.sql 里的 RPC 函数，计分是原子操作）。"""
 import asyncio
-from datetime import date
+from datetime import date, datetime, timezone
 
 from supabase import create_client, Client
 
@@ -81,3 +81,18 @@ async def find_by_username(username: str) -> list[dict]:
         return client().table("cb_users").select("user_id, username, full_name") \
             .ilike("username", name).limit(5).execute().data or []
     return await asyncio.to_thread(_q)
+
+
+async def get_setting(key: str, default: str | None = None) -> str | None:
+    def _q():
+        r = client().table("cb_settings").select("value").eq("key", key).execute().data
+        return r[0]["value"] if r else default
+    return await asyncio.to_thread(_q)
+
+
+async def set_setting(key: str, value: str, by: int | None = None):
+    def _q():
+        client().table("cb_settings").upsert(
+            {"key": key, "value": value, "updated_by": by,
+             "updated_at": datetime.now(timezone.utc).isoformat()}).execute()
+    await asyncio.to_thread(_q)
