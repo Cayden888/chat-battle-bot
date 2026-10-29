@@ -126,6 +126,78 @@ async def reply(context, msg: Message, text: str, kind: str = "reply", **kw):
 
 
 # --------------------------------------------------------------------------
+# 活动开关：/eventstart /eventend（只有审核人员 / 管理员）
+# 关闭时：不计分、不抓链接、玩家的 /points /quest /top /rules / 分数 / 任务 都不能用、周一不自动发名单
+# 状态存在 Supabase（cb_settings），Bot 重启也会记得
+# --------------------------------------------------------------------------
+EVENT_ON = True
+CLOSED_TEXT = "⏸ 【终极聊天争霸赛】目前没有进行中，等活动开始后再来哦！"
+
+
+async def load_event_state(app=None):
+    global EVENT_ON
+    try:
+        EVENT_ON = (await db.get_setting("event_on", "1")) != "0"
+    except Exception as e:
+        log.warning("读取活动开关失败（是否跑了 add_event_switch.sql？），先当作开启: %s", e)
+        EVENT_ON = True
+    log.info("活动状态: %s", "进行中" if EVENT_ON else "已结束")
+
+
+async def player_allowed(update: Update, context) -> bool:
+    """活动关闭时，玩家指令一律回复「没有进行中」；审核人员 / 管理员不受影响。"""
+    if EVENT_ON:
+        return True
+    if await is_admin(context, update.effective_chat.id, update.effective_user.id):
+        return True
+    await reply(context, update.effective_message, CLOSED_TEXT)
+    return False
+
+
+async def _announce(context, text: str):
+    for gid in config.GROUP_IDS:
+        try:
+            await context.bot.send_message(gid, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("announce to %s failed: %s", gid, e)
+
+
+async def cmd_event_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global EVENT_ON
+    if not await _require_admin(update, context):
+        return
+    if EVENT_ON:
+        return await reply(context, update.effective_message, "活动本来就在进行中 ✅", kind="keep")
+    await db.set_setting("event_on", "1", update.effective_user.id)
+    EVENT_ON = True
+    await reply(context, update.effective_message, "✅ 活动已开始，计分和所有指令恢复。", kind="keep")
+    if config.ANNOUNCE_EVENT_SWITCH:
+        await _announce(context, "🏁 <b>终极聊天争霸赛 开始啦！</b>\n从现在起在群里聊天就能拿积分，输入 /rules 查看规则。")
+
+
+async def cmd_event_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global EVENT_ON
+    if not await _require_admin(update, context):
+        return
+    if not EVENT_ON:
+        return await reply(context, update.effective_message, "活动本来就是结束状态 ⏸", kind="keep")
+    await db.set_setting("event_on", "0", update.effective_user.id)
+    EVENT_ON = False
+    await reply(context, update.effective_message,
+                "⏸ 活动已结束：停止计分，玩家指令暂停。\n积分会保留，/eventstart 重新开始。\n"
+                "需要名单的话打 /report", kind="keep")
+    if config.ANNOUNCE_EVENT_SWITCH:
+        await _announce(context, "⏸ <b>终极聊天争霸赛 已结束</b>\n现在聊天不会再计分，感谢大家参与！")
+
+
+async def cmd_event_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_admin(update, context):
+        return
+    await reply(context, update.effective_message,
+                f"活动状态：{'✅ 进行中' if EVENT_ON else '⏸ 已结束'}", kind="keep")
+
+
+# --------------------------------------------------------------------------
 # 违规处理：发 Link / QR
 # --------------------------------------------------------------------------
 REASONS = {
@@ -276,6 +348,8 @@ async def check_photo_qr(msg: Message, context) -> str | None:
 # --------------------------------------------------------------------------
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
+    if not EVENT_ON:
+        return
     if not in_event_group(update):
         log.info("skip: chat %s (%s) 不在 GROUP_IDS=%s", chat.id if chat else None,
                  chat.type if chat else None, config.GROUP_IDS)
@@ -356,12 +430,16 @@ def format_stats(user: User, s: dict) -> str:
 
 
 async def cmd_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await player_allowed(update, context):
+        return
     user, msg = update.effective_user, update.effective_message
     s = await db.my_stats(config.current_event(), config.today(), user.id)
     await reply(context, msg, format_stats(user, s), parse_mode=ParseMode.HTML)
 
 
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str = "reply"):
+    if kind == "reply" and not await player_allowed(update, context):
+        return
     msg = update.effective_message
     rows = await db.leaderboard(config.current_event(), 10)
     if not rows:
@@ -392,6 +470,8 @@ RULES = (
 
 
 async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str = "reply"):
+    if kind == "reply" and not await player_allowed(update, context):
+        return
     await reply(context, update.effective_message,
         RULES.format(roll=config.ROLLOVER_TIME.strftime("%H:%M"), rep=config.REPORT_TIME.strftime("%H:%M"),
                      n=config.TOP_N, prize=config.PRIZE_TEXT, turn=config.TURNOVER_REQ),
@@ -463,6 +543,8 @@ def format_quest(name: str, s: dict) -> str:
 
 async def cmd_quest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/quest 看自己的今日任务；reviewer / 管理员可以 /quest @username 看别人的"""
+    if not await player_allowed(update, context):
+        return
     msg, user = update.effective_message, update.effective_user
     args = list(context.args or [])
     uid, name = user.id, html.escape(user.full_name)
@@ -563,6 +645,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         ok, reason, _ = check_valid(" ".join(context.args))
         lines.append(f"{'✅' if ok else '❌'} 「{html.escape(' '.join(context.args))}」→ {reason}")
+    lines.append(f"{'✅ 活动进行中' if EVENT_ON else '⏸ 活动已结束（/eventstart 开始）'}")
     lines.append(f"⏰ 本期: {config.current_event()}  今天: {config.today()}")
     await reply(context, msg, "\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -617,6 +700,9 @@ async def send_report(context, event, chat_id: int, announce: bool):
 async def job_weekly_report(context: ContextTypes.DEFAULT_TYPE):
     # 周一 REPORT_TIME 执行：此时已经换期，上一期 = 本期 - 7 天
     event = config.current_event() - timedelta(days=7)
+    if not EVENT_ON:
+        log.info("活动已结束，跳过 %s 的自动名单（需要的话审核人员打 /report last）", event)
+        return
     log.info("weekly report for %s", event)
     target = config.CS_CHAT_ID or config.LOG_CHAT_ID
     if target:
@@ -625,7 +711,7 @@ async def job_weekly_report(context: ContextTypes.DEFAULT_TYPE):
 
 # --------------------------------------------------------------------------
 def main():
-    app = Application.builder().token(config.BOT_TOKEN).build()
+    app = Application.builder().token(config.BOT_TOKEN).post_init(load_event_state).build()
 
     app.add_handler(CommandHandler(["points", "score"], cmd_points))
     # 中文也能查分：直接打「分数」「积分」「查分」
@@ -642,6 +728,9 @@ def main():
     app.add_handler(CommandHandler(["quest", "task"], cmd_quest))
     app.add_handler(MessageHandler(filters.Regex(r"^\s*(任务|今日任务|我的任务)\s*$"), cmd_quest))
     app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler("eventstart", cmd_event_start))
+    app.add_handler(CommandHandler("eventend", cmd_event_end))
+    app.add_handler(CommandHandler("eventstatus", cmd_event_status))
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.UpdateType.EDITED & ~filters.StatusUpdate.ALL,
         on_group_message))
