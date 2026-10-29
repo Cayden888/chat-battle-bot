@@ -594,12 +594,27 @@ async def cmd_undq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/report → 本期实时名单；/report last → 上一期名单（重新发给客服）"""
+    """拿名单（任何一周都可以，资料不会删）：
+    /report            → 本周实时名单
+    /report last       → 上一周（= /report 1）
+    /report 2          → 两周前，以此类推
+    /report 2026-10-26 → 包含这一天的那一周
+    """
     if not await _require_admin(update, context):
         return
+    msg = update.effective_message
     event = config.current_event()
-    if context.args and context.args[0] == "last":
-        event -= timedelta(days=7)
+    arg = context.args[0].lower() if context.args else ""
+    try:
+        if arg in ("last", "上周"):
+            event -= timedelta(days=7)
+        elif arg.isdigit():
+            event -= timedelta(days=7 * int(arg))
+        elif arg:
+            d = datetime.strptime(arg, "%Y-%m-%d").replace(hour=12, tzinfo=config.TZ)
+            event = config.event_key_for(d)
+    except ValueError:
+        return await reply(context, msg, "用法：/report、/report last、/report 2、/report 2026-10-26", kind="keep")
     await send_report(context, event, chat_id=update.effective_chat.id, announce=False)
 
 
@@ -698,15 +713,23 @@ async def send_report(context, event, chat_id: int, announce: bool):
 
 
 async def job_weekly_report(context: ContextTypes.DEFAULT_TYPE):
-    # 周一 REPORT_TIME 执行：此时已经换期，上一期 = 本期 - 7 天
+    """周一 REPORT_TIME：上一周的名单发给客服群 + 每个审核人员（私讯），双保险。
+    活动关闭时只私讯审核人员，不发群公告。"""
     event = config.current_event() - timedelta(days=7)
-    if not EVENT_ON:
-        log.info("活动已结束，跳过 %s 的自动名单（需要的话审核人员打 /report last）", event)
-        return
-    log.info("weekly report for %s", event)
-    target = config.CS_CHAT_ID or config.LOG_CHAT_ID
-    if target:
-        await send_report(context, event, chat_id=target, announce=True)
+    log.info("weekly report for %s (event_on=%s)", event, EVENT_ON)
+    targets = []
+    if EVENT_ON and config.CS_CHAT_ID:
+        targets.append(config.CS_CHAT_ID)
+    targets += [r for r in config.REVIEWER_IDS if r not in targets]
+    if config.LOG_CHAT_ID and config.LOG_CHAT_ID not in targets:
+        targets.append(config.LOG_CHAT_ID)
+    announced = False
+    for t in targets:
+        try:
+            await send_report(context, event, chat_id=t, announce=EVENT_ON and not announced)
+            announced = True
+        except Exception as e:
+            log.warning("weekly report to %s failed（审核人员要先私讯 Bot 按 /start）: %s", t, e)
 
 
 # --------------------------------------------------------------------------
