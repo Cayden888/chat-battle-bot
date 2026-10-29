@@ -96,3 +96,7 @@ async def set_setting(key: str, value: str, by: int | None = None):
             {"key": key, "value": value, "updated_by": by,
              "updated_at": datetime.now(timezone.utc).isoformat()}).execute()
     await asyncio.to_thread(_q)
+
+
+async def reset(event: date, all_weeks: bool = False) -> dict:
+    return await rpc("cb_reset", {"p_event": event.isoformat(), "p_all": all_weeks}) or {}

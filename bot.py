@@ -190,6 +190,65 @@ async def cmd_event_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _announce(context, "⏸ <b>终极聊天争霸赛 已结束</b>\n现在聊天不会再计分，感谢大家参与！")
 
 
+async def cmd_event_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/eventreset → 本周清零；/eventreset all → 全部清零（测试用）。都要按按钮确认。"""
+    if not await _require_admin(update, context):
+        return
+    all_weeks = bool(context.args) and context.args[0].lower() == "all"
+    event = config.current_event()
+    if all_weeks:
+        text = ("⚠️ <b>确定要全部清零吗？</b>\n\n会删除<b>所有周</b>的积分、任务、违规记录和玩家资料，"
+                "之前所有名单都拿不回来。\n（适合测试完、正式开始前用）\n\n清零前会先把本周名单发给你备份。")
+    else:
+        start, end = config.event_range(event)
+        text = (f"⚠️ <b>确定要把本周清零吗？</b>\n本周：{start:%d/%m %H:%M} – {end:%d/%m %H:%M}\n\n"
+                "所有人本周积分、今日任务、重复记录、违规记录、取消资格都会归零。\n"
+                "以前几周的资料<b>不受影响</b>。\n\n清零前会先把本周名单发给你备份。")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🗑 确定清零", callback_data=f"rst:{event:%Y%m%d}:{'all' if all_weeks else 'wk'}"),
+        InlineKeyboardButton("取消", callback_data="rst:cancel"),
+    ]])
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def on_reset_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    u = q.from_user
+    if not (u.id in config.REVIEWER_IDS | config.ADMIN_IDS
+            or await is_admin(context, q.message.chat.id, u.id)):
+        return await q.answer("只有审核人员 / 管理员可以操作", show_alert=True)
+    parts = q.data.split(":")
+    if parts[1] == "cancel":
+        await q.answer("已取消")
+        return await q.edit_message_text("已取消，没有清零。")
+    event = datetime.strptime(parts[1], "%Y%m%d").date()
+    all_weeks = parts[2] == "all"
+    if event != config.current_event():
+        await q.answer("这个按钮已过期", show_alert=True)
+        return await q.edit_message_text("按钮已过期（已经换周），请重新打 /eventreset。")
+    await q.answer("清零中…")
+    # 1) 先备份：本周名单私讯给按按钮的人
+    try:
+        await send_report(context, event, chat_id=u.id, announce=False)
+    except Exception as e:
+        log.warning("reset backup failed: %s", e)
+    # 2) 清零
+    try:
+        r = await db.reset(event, all_weeks)
+    except Exception as e:
+        log.exception("reset failed")
+        return await q.edit_message_text(
+            f"❌ 清零失败：<code>{html.escape(str(e)[:200])}</code>\n"
+            "（是否已在 Supabase 跑 add_reset.sql？）", parse_mode=ParseMode.HTML)
+    who = f"@{u.username}" if u.username else u.full_name
+    scope = "全部资料" if all_weeks else "本周积分"
+    await q.edit_message_text(
+        f"✅ 已清零{scope}（{r.get('players', 0)} 位玩家）— {html.escape(who)}\n"
+        f"清零前的名单已私讯给你备份。", parse_mode=ParseMode.HTML)
+    log.info("RESET %s by %s: %s", "ALL" if all_weeks else event, u.id, r)
+    await send_log(context, f"🗑 <b>{scope}已清零</b> — {html.escape(who)} (<code>{u.id}</code>)")
+
+
 async def cmd_event_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_admin(update, context):
         return
@@ -632,6 +691,8 @@ COMMAND_LIST = """📖 <b>终极聊天争霸赛 · 指令清单</b>
 /eventstart — 开始活动
 /eventend — 结束活动（停止计分，玩家指令暂停，积分保留）
 /eventstatus — 现在是开始还是结束
+/eventreset — 本周积分清零（要按按钮确认，会先备份名单）
+/eventreset all — 全部资料清零（测试完、正式开始前用）
 
 <u>资格</u>
 /dq @username 原因 — 取消本期资格
@@ -814,6 +875,8 @@ def main():
     app.add_handler(CommandHandler("eventstart", cmd_event_start))
     app.add_handler(CommandHandler("eventend", cmd_event_end))
     app.add_handler(CommandHandler("eventstatus", cmd_event_status))
+    app.add_handler(CommandHandler("eventreset", cmd_event_reset))
+    app.add_handler(CallbackQueryHandler(on_reset_button, pattern=r"^rst:"))
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.UpdateType.EDITED & ~filters.StatusUpdate.ALL,
         on_group_message))
