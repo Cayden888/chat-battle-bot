@@ -218,7 +218,10 @@ async def check_photo_qr(msg: Message, context) -> str | None:
 # 主逻辑：群消息
 # --------------------------------------------------------------------------
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
     if not in_event_group(update):
+        log.info("skip: chat %s (%s) 不在 GROUP_IDS=%s", chat.id if chat else None,
+                 chat.type if chat else None, config.GROUP_IDS)
         return
     msg, user = update.effective_message, update.effective_user
     if not user or user.is_bot or msg.sender_chat:          # 频道/匿名管理员发言不算
@@ -239,9 +242,11 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2) 计分：只算普通文字（转发、贴纸、纯图片不算；管理员不参加）
     if admin or not text or msg.forward_origin or text.startswith("/"):
+        log.info("skip: user %s admin=%s text=%s forward=%s", user.id, admin, bool(text), bool(msg.forward_origin))
         return
     ok, reason, norm = check_valid(text)
     if not ok:
+        log.info("skip: user %s 无效发言 (%s)", user.id, reason)
         return
 
     try:
@@ -250,6 +255,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("record failed: %s", e)
         return
 
+    log.info("user %s → %s", user.id, res)
     if res.get("status") == "ok" and res.get("bonus"):
         daily = res["daily"]
         if daily == 5:
@@ -388,6 +394,39 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML)
 
 
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """在群里打 /debug：一次检查所有可能让计分失败的原因"""
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    lines = ["🔧 <b>Debug</b>"]
+    me = await context.bot.get_me()
+    can_read = bool(me.can_read_all_group_messages)
+    lines.append(f"{'✅' if can_read else '❌'} Privacy 已关闭（能看到普通聊天）"
+                 + ("" if can_read else "\n   → @BotFather /setprivacy → Disable，再把 Bot 踢出群重新拉进来"))
+    in_group = not config.GROUP_IDS or chat.id in config.GROUP_IDS
+    lines.append(f"{'✅' if in_group else '❌'} 这个群在 GROUP_IDS 里"
+                 f"\n   这个群: <code>{chat.id}</code>（{chat.type}）"
+                 f"\n   GROUP_IDS: <code>{','.join(map(str, config.GROUP_IDS)) or '(空=全部群)'}</code>"
+                 + ("" if in_group else f"\n   → Railway 把 GROUP_IDS 改成 {chat.id}"))
+    admin = await is_admin(context, chat.id, user.id)
+    lines.append(f"{'⚠️ 你是管理员（不计分）' if admin else '✅ 你不是管理员（会计分）'}  <code>{user.id}</code>")
+    try:
+        s = await db.my_stats(config.current_event(), config.today(), user.id)
+        lines.append(f"✅ Supabase 连接正常（你本期 {s.get('points', 0)} 分）")
+        try:
+            await db.lifetime_valid(user.id)
+            lines.append("✅ Supabase 读表权限正常")
+        except Exception as e:
+            lines.append(f"❌ Supabase 读表失败: <code>{html.escape(str(e)[:200])}</code>")
+    except Exception as e:
+        lines.append(f"❌ Supabase 连接失败: <code>{html.escape(str(e)[:300])}</code>"
+                     "\n   → 检查 SUPABASE_URL / SUPABASE_SERVICE_KEY（可换 Legacy 的 service_role eyJ... key）")
+    if context.args:
+        ok, reason, _ = check_valid(" ".join(context.args))
+        lines.append(f"{'✅' if ok else '❌'} 「{html.escape(' '.join(context.args))}」→ {reason}")
+    lines.append(f"⏰ 本期: {config.current_event()}  今天: {config.today()}")
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 # --------------------------------------------------------------------------
 # 周一派奖：Top N 名单给客服 + 群公告
 # --------------------------------------------------------------------------
@@ -458,6 +497,7 @@ def main():
     app.add_handler(CommandHandler("undq", cmd_undq))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.UpdateType.EDITED & ~filters.StatusUpdate.ALL,
         on_group_message))
