@@ -81,6 +81,37 @@ async def send_log(context: ContextTypes.DEFAULT_TYPE, text: str):
 
 
 # --------------------------------------------------------------------------
+# 自动删除：Bot 在群里的回复过一段时间自动删掉（时间在 config.py / Railway Variables 设）
+# --------------------------------------------------------------------------
+async def _delete_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id, message_ids = context.job.data
+    for mid in message_ids:
+        try:
+            await context.bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+
+def _delete_seconds(kind: str) -> int:
+    return {
+        "congrats": config.CONGRATS_DELETE_SEC,
+        "warning": config.WARNING_DELETE_SEC,
+    }.get(kind, config.REPLY_DELETE_SEC)
+
+
+async def reply(context, msg: Message, text: str, kind: str = "reply", **kw):
+    """所有群里的回复都走这里。kind: congrats / warning / reply"""
+    m = await msg.reply_text(text, **kw)
+    secs = _delete_seconds(kind)
+    if secs > 0 and m.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and context.job_queue:
+        ids = [m.message_id]
+        if kind == "reply" and config.DELETE_COMMAND_MSG and (msg.text or "").startswith("/"):
+            ids.append(msg.message_id)
+        context.job_queue.run_once(_delete_job, secs, data=(m.chat_id, ids))
+    return m
+
+
+# --------------------------------------------------------------------------
 # 违规处理：发 Link / QR
 # --------------------------------------------------------------------------
 REASONS = {
@@ -120,11 +151,11 @@ async def flag_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, kin
 
     # 1) 群警告
     try:
-        await msg.reply_text(
+        await reply(context, msg,
             f"⚠️ {name} 请勿在群内{label}。\n"
             f"这违反了【终极聊天争霸赛】规则，已提交管理员审核，"
             f"可能会被取消本期活动资格。（本期第 {warn_count} 次警告）",
-            parse_mode=ParseMode.HTML)
+            kind="warning", parse_mode=ParseMode.HTML)
     except Exception as e:
         log.warning("group warning failed: %s", e)
 
@@ -264,7 +295,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             t = (f"🔥 {mention(user.id, html.escape(user.first_name))} 完成今日 10 条有效发言任务 +5，"
                  f"全部任务达成再 +5！当前 {res['points']} 分")
         try:
-            await msg.reply_text(t, parse_mode=ParseMode.HTML, disable_notification=True)
+            await reply(context, msg, t, kind="congrats", parse_mode=ParseMode.HTML, disable_notification=True)
         except Exception:
             pass
 
@@ -301,7 +332,7 @@ def format_stats(user: User, s: dict) -> str:
 async def cmd_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user, msg = update.effective_user, update.effective_message
     s = await db.my_stats(config.current_event(), config.today(), user.id)
-    await msg.reply_text(format_stats(user, s), parse_mode=ParseMode.HTML)
+    await reply(context, msg, format_stats(user, s), parse_mode=ParseMode.HTML)
 
 
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -314,7 +345,7 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         body = "\n".join(f"{medals.get(r['rank'], str(r['rank']) + '.')} {display_name(r)} — {r['points']} 分"
                          for r in rows)
         text = f"🏆 <b>终极聊天争霸赛 · 实时 Top 10</b>\n\n{body}\n\n输入 /points 查看自己的分数"
-    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+    await reply(context, msg, text, parse_mode=ParseMode.HTML)
 
 
 RULES = (
@@ -330,12 +361,12 @@ RULES = (
     "✅ 和群友轻松聊天、参与讨论、分享心得\n"
     "❌ 重复内容 / 只发表情 / 单个字 / 刷屏 不计分\n"
     "🚫 发链接、二维码 = 取消资格，钓鱼号直接踢出\n\n"
-    "输入 /points 查看分数，/top 查看排行榜"
+    "输入 /points 查看分数，/quest 查看今日任务，/top 查看排行榜"
 )
 
 
 async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
+    await reply(context, update.effective_message, 
         RULES.format(roll=config.ROLLOVER_TIME.strftime("%H:%M"), rep=config.REPORT_TIME.strftime("%H:%M"),
                      n=config.TOP_N, prize=config.PRIZE_TEXT, turn=config.TURNOVER_REQ),
         parse_mode=ParseMode.HTML)
@@ -343,7 +374,7 @@ async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _require_admin(update: Update, context) -> bool:
     if not await is_admin(context, update.effective_chat.id, update.effective_user.id):
-        await update.effective_message.reply_text("只有管理员可以使用这个指令。")
+        await reply(context, update.effective_message, "只有管理员可以使用这个指令。")
         return False
     return True
 
@@ -367,6 +398,48 @@ async def resolve_target(update: Update, args: list[str]):
     return r["user_id"], r.get("username"), r.get("full_name"), "", None
 
 
+def format_quest(name: str, s: dict) -> str:
+    today = s.get("today", 0)
+    def box(done): return "✅" if done else "⬜"
+    lines = [f"📋 <b>今日任务</b>  {config.today():%d/%m}", f"👤 {name}", ""]
+    if s.get("disqualified"):
+        lines.append("❌ 本期资格已取消（违规发送链接 / 二维码）")
+        return "\n".join(lines)
+    lines += [
+        f"{box(today >= 1)} 有效发言  每条 +1 分（已发 {today} 条，无上限）",
+        f"{box(today >= 5)} 发满 5 条  +5 分（{min(today, 5)}/5）",
+        f"{box(today >= 10)} 发满 10 条  +5 分（{min(today, 10)}/10）",
+        f"{box(today >= 10)} 完成全部任务  +5 分",
+        "",
+    ]
+    earned = today + (5 if today >= 5 else 0) + (10 if today >= 10 else 0)
+    lines.append(f"⭐ 今日已得 <b>{earned}</b> 分  |  本期总分 <b>{s.get('points', 0)}</b> 分")
+    if today < 5:
+        lines.append(f"🎯 再聊 {5 - today} 条拿 +5 分")
+    elif today < 10:
+        lines.append(f"🎯 再聊 {10 - today} 条拿 +10 分（10条任务 + 全部完成）")
+    else:
+        lines.append("🔥 今日任务全部完成！继续聊天每条 +1 分")
+    lines.append("⏰ 任务每天 00:00（马来西亚时间）重置")
+    return "\n".join(lines)
+
+
+async def cmd_quest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/quest 看自己的今日任务；reviewer / 管理员可以 /quest @username 看别人的"""
+    msg, user = update.effective_message, update.effective_user
+    args = list(context.args or [])
+    uid, name = user.id, html.escape(user.full_name)
+    if args or (msg.reply_to_message and msg.reply_to_message.from_user):
+        if not await is_admin(context, update.effective_chat.id, user.id):
+            return await reply(context, msg, "只有管理员 / 审核人员可以查看别人的任务。")
+        uid, uname, fname, _, err = await resolve_target(update, args)
+        if err:
+            return await reply(context, msg, err if err != "missing" else "用法：/quest @username", parse_mode=ParseMode.HTML)
+        name = html.escape(f"@{uname}" if uname else (fname or str(uid))) + f" (<code>{uid}</code>)"
+    s = await db.my_stats(config.current_event(), config.today(), uid)
+    await reply(context, msg, format_quest(name, s), parse_mode=ParseMode.HTML)
+
+
 async def cmd_dq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """取消资格：回复玩家消息 /dq 原因，或 /dq <user_id 或 @username> 原因"""
     if not await _require_admin(update, context):
@@ -375,13 +448,13 @@ async def cmd_dq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = list(context.args)
     uid, uname, fname, snippet, err = await resolve_target(update, args)
     if err == "missing":
-        return await msg.reply_text("用法：/dq @username 原因\n或 /dq <user_id> 原因\n或在群里回复玩家消息打 /dq 原因")
+        return await reply(context, msg, "用法：/dq @username 原因\n或 /dq <user_id> 原因\n或在群里回复玩家消息打 /dq 原因")
     if err:
-        return await msg.reply_text(err, parse_mode=ParseMode.HTML)
+        return await reply(context, msg, err, parse_mode=ParseMode.HTML)
     reason = " ".join(args) or "manual"
     await db.disqualify(config.current_event(), uid, uname, fname, "manual", reason, snippet)
     who = f"@{uname}" if uname else (fname or "")
-    await msg.reply_text(f"❌ 已取消 {html.escape(who)} (<code>{uid}</code>) 本期资格。", parse_mode=ParseMode.HTML)
+    await reply(context, msg, f"❌ 已取消 {html.escape(who)} (<code>{uid}</code>) 本期资格。", kind="warning", parse_mode=ParseMode.HTML)
 
 
 async def cmd_undq(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,14 +464,14 @@ async def cmd_undq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     uid, uname, fname, _, err = await resolve_target(update, list(context.args))
     if err == "missing":
-        return await msg.reply_text("用法：/undq @username\n或 /undq <user_id>\n或在群里回复玩家消息打 /undq")
+        return await reply(context, msg, "用法：/undq @username\n或 /undq <user_id>\n或在群里回复玩家消息打 /undq")
     if err:
-        return await msg.reply_text(err, parse_mode=ParseMode.HTML)
+        return await reply(context, msg, err, parse_mode=ParseMode.HTML)
     s = await db.my_stats(config.current_event(), config.today(), uid)
     await db.undq(config.current_event(), uid)
     who = f"@{uname}" if uname else (fname or "")
-    await msg.reply_text(f"✅ 已恢复 {html.escape(who)} (<code>{uid}</code>) 本期资格，积分 {s.get('points', 0)} 分保留。",
-                         parse_mode=ParseMode.HTML)
+    await reply(context, msg, f"✅ 已恢复 {html.escape(who)} (<code>{uid}</code>) 本期资格，积分 {s.get('points', 0)} 分保留。",
+                         kind="warning", parse_mode=ParseMode.HTML)
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -412,7 +485,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
+    await reply(context, update.effective_message, 
         f"chat_id: <code>{update.effective_chat.id}</code>\nuser_id: <code>{update.effective_user.id}</code>",
         parse_mode=ParseMode.HTML)
 
@@ -447,7 +520,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ok, reason, _ = check_valid(" ".join(context.args))
         lines.append(f"{'✅' if ok else '❌'} 「{html.escape(' '.join(context.args))}」→ {reason}")
     lines.append(f"⏰ 本期: {config.current_event()}  今天: {config.today()}")
-    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await reply(context, msg, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # --------------------------------------------------------------------------
@@ -520,6 +593,8 @@ def main():
     app.add_handler(CommandHandler("undq", cmd_undq))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler(["quest", "task"], cmd_quest))
+    app.add_handler(MessageHandler(filters.Regex(r"^\s*(任务|今日任务|我的任务)\s*$"), cmd_quest))
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.UpdateType.EDITED & ~filters.StatusUpdate.ALL,

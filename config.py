@@ -38,6 +38,14 @@ MIN_INTERVAL_SEC = int(os.getenv("MIN_INTERVAL_SEC", "3"))   # 两条有效发�
 NEWBIE_THRESHOLD = int(os.getenv("NEWBIE_THRESHOLD", "5"))   # 历史有效发言 < 这个数 + 发Link = 报告里标注「疑似钓鱼」
 QR_CHECK = os.getenv("QR_CHECK", "1") == "1"
 
+# ===== 自动删除 Bot 在群里的回复（秒；0 = 不删除）=====
+# 以后要改时间：去 Railway → Variables 改这几个值，不用改代码
+CONGRATS_DELETE_SEC = int(os.getenv("CONGRATS_DELETE_SEC", "30"))   # 恭喜完成 5条 / 10条任务
+REPLY_DELETE_SEC = int(os.getenv("REPLY_DELETE_SEC", "20"))         # /points /quest /top /rules /id /debug 等指令的回复
+WARNING_DELETE_SEC = int(os.getenv("WARNING_DELETE_SEC", "0"))      # 违规警告 + /dq /undq 结果（默认 0 = 保留，方便之后回复他 unban）
+DELETE_COMMAND_MSG = os.getenv("DELETE_COMMAND_MSG", "0") == "1"    # 1 = 连玩家打的 /points 等指令一起删（Bot 需要管理员「删除消息」权限）
+# 不会自动删除：周一赢家公告、客服群名单、私讯给审核人员的报告、私聊 Bot 的回复
+
 
 def now() -> datetime:
     return datetime.now(TZ)
