@@ -618,6 +618,65 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_report(context, event, chat_id=update.effective_chat.id, announce=False)
 
 
+COMMAND_LIST = """📖 <b>终极聊天争霸赛 · 指令清单</b>
+
+<b>👥 玩家（所有人）</b>
+/points 或打「分数」— 我的积分、排名
+/quest 或打「任务」— 今日任务进度 ✅⬜
+/top — 实时 Top 10
+/rules — 活动规则
+<i>（群里的回复 20 秒后自动删除）</i>
+
+<b>🛡 审核人员 / 管理员</b>
+<u>活动开关</u>
+/eventstart — 开始活动
+/eventend — 结束活动（停止计分，玩家指令暂停，积分保留）
+/eventstatus — 现在是开始还是结束
+
+<u>资格</u>
+/dq @username 原因 — 取消本期资格
+/undq @username — 恢复资格（积分保留）
+<i>也可以用 user_id，或在群里回复玩家的消息打指令</i>
+
+<u>查看</u>
+/quest @username — 看某玩家今日任务
+/topX — 排行榜（不会自动删除，适合公告）
+/rulesX — 规则（不会自动删除）
+
+<u>名单</u>
+/report — 本周实时 Top 20 + CSV
+/report last — 上一周
+/report 2 — 两周前（3、4… 以此类推）
+/report 2026-10-26 — 包含这一天的那一周
+
+<u>工具</u>
+/debug — 检查 Bot 设定（打在活动群里）
+/id — 查 chat_id / user_id
+/list — 这个清单
+
+<b>🚨 违规报告按钮</b>
+❌ 取消本期资格 — 警告保留在群里
+✅ 忽略 — 自动删除群里的警告
+
+<b>⏰ 自动</b>
+每周一 10:30 换期（新一周从 0 分开始，旧资料保留）
+每周一 11:00 名单发给客服群 + 私讯审核人员"""
+
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """审核人员看全部指令。在群里打会改成私讯，避免玩家看到管理指令。"""
+    if not await _require_admin(update, context):
+        return
+    msg, chat = update.effective_message, update.effective_chat
+    if chat.type == ChatType.PRIVATE:
+        return await msg.reply_text(COMMAND_LIST, parse_mode=ParseMode.HTML)
+    try:
+        await context.bot.send_message(update.effective_user.id, COMMAND_LIST, parse_mode=ParseMode.HTML)
+        await reply(context, msg, "📖 指令清单已私讯给你。")
+    except Exception:
+        await reply(context, msg, "请先私讯我按一次 Start，再打 /list。")
+
+
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(context, update.effective_message, 
         f"chat_id: <code>{update.effective_chat.id}</code>\nuser_id: <code>{update.effective_user.id}</code>",
@@ -751,6 +810,7 @@ def main():
     app.add_handler(CommandHandler(["quest", "task"], cmd_quest))
     app.add_handler(MessageHandler(filters.Regex(r"^\s*(任务|今日任务|我的任务)\s*$"), cmd_quest))
     app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler(["list", "help_admin"], cmd_list))
     app.add_handler(CommandHandler("eventstart", cmd_event_start))
     app.add_handler(CommandHandler("eventend", cmd_event_end))
     app.add_handler(CommandHandler("eventstatus", cmd_event_status))
