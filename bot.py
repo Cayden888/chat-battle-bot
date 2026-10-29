@@ -348,34 +348,57 @@ async def _require_admin(update: Update, context) -> bool:
     return True
 
 
+async def resolve_target(update: Update, args: list[str]):
+    """找出要处理的玩家：回复消息 / user_id / @username。返回 (uid, username, name, snippet, 错误讯息)"""
+    target = update.effective_message.reply_to_message
+    if target and target.from_user and not target.from_user.is_bot:
+        u = target.from_user
+        return u.id, u.username, u.full_name, target.text or "", None
+    if not args:
+        return None, None, None, "", "missing"
+    key = args.pop(0)
+    if key.lstrip("-").isdigit():
+        return int(key), None, None, "", None
+    rows = await db.find_by_username(key)
+    if not rows:
+        return None, None, None, "", (f"找不到 {html.escape(key)}。\n这个人可能没在群里发过言，或者改了 username。"
+                                       f"\n可以在群里回复他的消息打指令，或用违规报告里的 🆔 ID。")
+    r = rows[0]
+    return r["user_id"], r.get("username"), r.get("full_name"), "", None
+
+
 async def cmd_dq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """取消资格：在群里回复某人的消息输入 /dq 原因，或在任何地方 /dq <user_id> 原因"""
+    """取消资格：回复玩家消息 /dq 原因，或 /dq <user_id 或 @username> 原因"""
     if not await _require_admin(update, context):
         return
     msg = update.effective_message
-    target = msg.reply_to_message
     args = list(context.args)
-    if target and target.from_user:
-        u = target.from_user
-        uid, uname, fname, snippet = u.id, u.username, u.full_name, target.text or ""
-    elif args and args[0].isdigit():
-        uid, uname, fname, snippet = int(args.pop(0)), None, None, ""
-    else:
-        return await msg.reply_text("用法：回复玩家消息输入 /dq 原因，或 /dq <user_id> 原因")
+    uid, uname, fname, snippet, err = await resolve_target(update, args)
+    if err == "missing":
+        return await msg.reply_text("用法：/dq @username 原因\n或 /dq <user_id> 原因\n或在群里回复玩家消息打 /dq 原因")
+    if err:
+        return await msg.reply_text(err, parse_mode=ParseMode.HTML)
     reason = " ".join(args) or "manual"
     await db.disqualify(config.current_event(), uid, uname, fname, "manual", reason, snippet)
-    await msg.reply_text(f"已取消 <code>{uid}</code> 本期资格。", parse_mode=ParseMode.HTML)
+    who = f"@{uname}" if uname else (fname or "")
+    await msg.reply_text(f"❌ 已取消 {html.escape(who)} (<code>{uid}</code>) 本期资格。", parse_mode=ParseMode.HTML)
 
 
 async def cmd_undq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """恢复资格：/undq @username，或 /undq <user_id>，或在群里回复玩家消息 /undq"""
     if not await _require_admin(update, context):
         return
-    target = update.effective_message.reply_to_message
-    uid = target.from_user.id if target and target.from_user else (int(context.args[0]) if context.args else None)
-    if not uid:
-        return await update.effective_message.reply_text("回复玩家消息输入 /undq，或 /undq <user_id>")
+    msg = update.effective_message
+    uid, uname, fname, _, err = await resolve_target(update, list(context.args))
+    if err == "missing":
+        return await msg.reply_text("用法：/undq @username\n或 /undq <user_id>\n或在群里回复玩家消息打 /undq")
+    if err:
+        return await msg.reply_text(err, parse_mode=ParseMode.HTML)
+    s = await db.my_stats(config.current_event(), config.today(), uid)
     await db.undq(config.current_event(), uid)
-    await update.effective_message.reply_text(f"已恢复 <code>{uid}</code> 本期资格。", parse_mode=ParseMode.HTML)
+    who = f"@{uname}" if uname else (fname or "")
+    await msg.reply_text(f"✅ 已恢复 {html.escape(who)} (<code>{uid}</code>) 本期资格，积分 {s.get('points', 0)} 分保留。",
+                         parse_mode=ParseMode.HTML)
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):

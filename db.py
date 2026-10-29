@@ -72,3 +72,12 @@ async def lifetime_valid(user_id: int) -> int:
         r = client().table("cb_users").select("lifetime_valid").eq("user_id", user_id).execute().data
         return r[0]["lifetime_valid"] if r else 0
     return await asyncio.to_thread(_q)
+
+
+async def find_by_username(username: str) -> list[dict]:
+    """用 @username 找玩家（不分大小写）。只找得到在群里发过言 / 被记录过的人。"""
+    name = username.lstrip("@").strip()
+    def _q():
+        return client().table("cb_users").select("user_id, username, full_name") \
+            .ilike("username", name).limit(5).execute().data or []
+    return await asyncio.to_thread(_q)
