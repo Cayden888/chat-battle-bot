@@ -19,6 +19,7 @@ from telegram.ext import (
 import config
 import db
 from msg_filters import check_valid, content_hash, has_link
+from texts import t
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -58,6 +59,15 @@ def in_event_group(update: Update) -> bool:
     chat = update.effective_chat
     return chat is not None and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) \
         and (not config.GROUP_IDS or chat.id in config.GROUP_IDS)
+
+
+def lang_of(update: Update) -> str:
+    """这个对话用哪种语言：群看 GROUP_LANGS；私聊看玩家 Telegram 的语言设定。"""
+    chat, user = update.effective_chat, update.effective_user
+    if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return config.GROUP_LANGS.get(chat.id, "zh")
+    code = (getattr(user, "language_code", None) or "").lower()
+    return "ms" if code.startswith(("ms", "id")) else "zh"
 
 
 def display_name(row: dict) -> str:
@@ -102,7 +112,9 @@ def _delete_seconds(kind: str) -> int:
 
 
 # 玩家用来叫 Bot 的中文关键字（和指令一样，会被一起自动删除）
-TEXT_TRIGGERS = re.compile(r"^\s*(分数|积分|查分|我的分数|我的积分|任务|今日任务|我的任务)\s*$")
+POINTS_WORDS = r"分数|积分|查分|我的分数|我的积分|markah|skor|mata saya|markah saya"
+QUEST_WORDS = r"任务|今日任务|我的任务|misi|misi saya|misi hari ini|tugasan"
+TEXT_TRIGGERS = re.compile(rf"^\s*({POINTS_WORDS}|{QUEST_WORDS})\s*$", re.IGNORECASE)
 
 
 def _is_trigger(text: str | None) -> bool:
@@ -131,7 +143,6 @@ async def reply(context, msg: Message, text: str, kind: str = "reply", **kw):
 # 状态存在 Supabase（cb_settings），Bot 重启也会记得
 # --------------------------------------------------------------------------
 EVENT_ON = True
-CLOSED_TEXT = "⏸ 【终极聊天争霸赛】目前没有进行中，等活动开始后再来哦！"
 
 
 async def load_event_state(app=None):
@@ -142,6 +153,21 @@ async def load_event_state(app=None):
         log.warning("读取活动开关失败（是否跑了 add_event_switch.sql？），先当作开启: %s", e)
         EVENT_ON = True
     log.info("活动状态: %s", "进行中" if EVENT_ON else "已结束")
+    # 用 /setgroup 设过的活动群，优先于 Railway 的 GROUP_IDS
+    try:
+        saved = await db.get_setting("group_ids")
+        if saved:
+            config.GROUP_IDS.clear()
+            config.GROUP_IDS.update(int(x) for x in saved.split(",") if x.strip())
+    except Exception as e:
+        log.warning("读取活动群设定失败，使用 Railway 的 GROUP_IDS: %s", e)
+    try:
+        saved_langs = await db.get_setting("group_langs")
+        if saved_langs:
+            config.GROUP_LANGS.update(config._langs(saved_langs))
+    except Exception as e:
+        log.warning("读取群语言设定失败: %s", e)
+    log.info("活动群: %s  语言: %s", config.GROUP_IDS or "(全部群)", config.GROUP_LANGS)
 
 
 async def player_allowed(update: Update, context) -> bool:
@@ -150,14 +176,15 @@ async def player_allowed(update: Update, context) -> bool:
         return True
     if await is_admin(context, update.effective_chat.id, update.effective_user.id):
         return True
-    await reply(context, update.effective_message, CLOSED_TEXT)
+    await reply(context, update.effective_message, t(lang_of(update), "closed"))
     return False
 
 
-async def _announce(context, text: str):
+async def _announce(context, key: str):
+    """发公告到每个活动群，各用自己群的语言（texts.py 的 key）"""
     for gid in config.GROUP_IDS:
         try:
-            await context.bot.send_message(gid, text, parse_mode=ParseMode.HTML)
+            await context.bot.send_message(gid, t(config.GROUP_LANGS.get(gid, "zh"), key), parse_mode=ParseMode.HTML)
         except Exception as e:
             log.warning("announce to %s failed: %s", gid, e)
 
@@ -172,7 +199,7 @@ async def cmd_event_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     EVENT_ON = True
     await reply(context, update.effective_message, "✅ 活动已开始，计分和所有指令恢复。", kind="keep")
     if config.ANNOUNCE_EVENT_SWITCH:
-        await _announce(context, "🏁 <b>终极聊天争霸赛 开始啦！</b>\n从现在起在群里聊天就能拿积分，输入 /rules 查看规则。")
+        await _announce(context, "event_started")
 
 
 async def cmd_event_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -187,7 +214,7 @@ async def cmd_event_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⏸ 活动已结束：停止计分，玩家指令暂停。\n积分会保留，/eventstart 重新开始。\n"
                 "需要名单的话打 /report", kind="keep")
     if config.ANNOUNCE_EVENT_SWITCH:
-        await _announce(context, "⏸ <b>终极聊天争霸赛 已结束</b>\n现在聊天不会再计分，感谢大家参与！")
+        await _announce(context, "event_ended")
 
 
 async def cmd_event_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,6 +276,62 @@ async def on_reset_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_log(context, f"🗑 <b>{scope}已清零</b> — {html.escape(who)} (<code>{u.id}</code>)")
 
 
+async def _save_groups(by: int | None = None):
+    await db.set_setting("group_ids", ",".join(str(g) for g in sorted(config.GROUP_IDS)), by)
+    await db.set_setting("group_langs", ",".join(f"{g}:{l}" for g, l in sorted(config.GROUP_LANGS.items())), by)
+
+
+async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """在活动群里打：
+    /setgroup          → 只用这个群（其他群移除）
+    /setgroup add      → 加上这个群（多群，分数合并）
+    后面可以加语言：/setgroup add ms（马来文）、/setgroup zh（华语）
+    """
+    if not await _require_admin(update, context):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return await reply(context, msg, "请在要做活动的群里打 /setgroup", kind="keep")
+    args = [a.lower() for a in (context.args or [])]
+    adding = "add" in args
+    lang = next((a for a in args if a in ("zh", "ms")), None)
+    if not adding:
+        config.GROUP_IDS.clear()
+    config.GROUP_IDS.add(chat.id)
+    if lang:
+        config.GROUP_LANGS[chat.id] = lang
+    await _save_groups(update.effective_user.id)
+    note = ""
+    if chat.type == ChatType.GROUP:
+        note = "\n⚠️ 这是普通群，以后 Telegram 可能自动升级成超级群，Bot 会自动跟上新 ID。"
+    names = {"zh": "华语", "ms": "马来文"}
+    listing = "\n".join(f"• <code>{g}</code> — {names[config.GROUP_LANGS.get(g, 'zh')]}" for g in sorted(config.GROUP_IDS))
+    await reply(context, msg,
+                f"✅ 已{'加上' if adding else '设为'}活动群：<code>{chat.id}</code>"
+                f"（{names[config.GROUP_LANGS.get(chat.id, 'zh')]}）\n\n现在的活动群：\n{listing}{note}",
+                kind="keep", parse_mode=ParseMode.HTML)
+
+
+async def on_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """普通群被升级成超级群时，Telegram 会换一个新的群 ID —— 自动把活动群换成新 ID。"""
+    msg = update.effective_message
+    if msg.migrate_to_chat_id:                 # 旧群收到的消息
+        old, new = msg.chat_id, msg.migrate_to_chat_id
+    elif msg.migrate_from_chat_id:             # 新群收到的消息
+        old, new = msg.migrate_from_chat_id, msg.chat_id
+    else:
+        return
+    if old not in config.GROUP_IDS or new in config.GROUP_IDS:
+        return
+    config.GROUP_IDS.discard(old)
+    config.GROUP_IDS.add(new)
+    if old in config.GROUP_LANGS:
+        config.GROUP_LANGS[new] = config.GROUP_LANGS.pop(old)
+    await _save_groups()
+    log.info("group migrated %s -> %s", old, new)
+    await send_log(context, f"🔄 活动群升级成超级群，ID 已自动更新：<code>{old}</code> → <code>{new}</code>")
+
+
 async def cmd_event_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_admin(update, context):
         return
@@ -285,6 +368,7 @@ async def flag_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, kin
     event = config.current_event()
     label, why = REASONS.get(kind, (kind, "违反活动规则。"))
     name = mention(user.id, html.escape(user.full_name))
+    lang = lang_of(update)
 
     try:
         warn_count = await db.flag(event, user.id, user.username, user.full_name, kind, snippet)
@@ -298,9 +382,7 @@ async def flag_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, kin
     warn_ref = ""
     try:
         wm = await reply(context, msg,
-            f"⚠️ {name} 请勿在群内{label}。\n"
-            f"这违反了【终极聊天争霸赛】规则，已提交管理员审核，"
-            f"可能会被取消本期活动资格。（本期第 {warn_count} 次警告）",
+            t(lang, "warning", name=name, label=t(lang, f"label_{kind}"), n=warn_count),
             kind="warning", parse_mode=ParseMode.HTML)
         warn_ref = f":{wm.chat_id}:{wm.message_id}"
     except Exception as e:
@@ -329,12 +411,12 @@ async def flag_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, kin
         InlineKeyboardButton("✅ 忽略", callback_data=f"ok:{event:%Y%m%d}:{user.id}{warn_ref}"),
     ]])
     targets = list(config.REVIEWER_IDS) + ([config.LOG_CHAT_ID] if config.LOG_CHAT_ID else [])
-    for t in targets:
+    for tgt in targets:
         try:
-            await context.bot.send_message(t, report, parse_mode=ParseMode.HTML,
+            await context.bot.send_message(tgt, report, parse_mode=ParseMode.HTML,
                                            reply_markup=kb, disable_web_page_preview=True)
         except Exception as e:
-            log.warning("report to %s failed（审核人员要先私讯 Bot 按 /start）: %s", t, e)
+            log.warning("report to %s failed（审核人员要先私讯 Bot 按 /start）: %s", tgt, e)
 
 
 async def on_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -448,13 +530,13 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info("user %s → %s", user.id, res)
     if res.get("status") == "ok" and res.get("bonus"):
         daily = res["daily"]
+        who = mention(user.id, html.escape(user.first_name))
         if daily == 5:
-            t = f"🎯 {mention(user.id, html.escape(user.first_name))} 完成今日 5 条有效发言任务，+5 分！"
+            text = t(lang_of(update), "congrats5", name=who)
         else:
-            t = (f"🔥 {mention(user.id, html.escape(user.first_name))} 完成今日 10 条有效发言任务 +5，"
-                 f"全部任务达成再 +5！当前 {res['points']} 分")
+            text = t(lang_of(update), "congrats10", name=who, points=res["points"])
         try:
-            await reply(context, msg, t, kind="congrats", parse_mode=ParseMode.HTML, disable_notification=True)
+            await reply(context, msg, text, kind="congrats", parse_mode=ParseMode.HTML, disable_notification=True)
         except Exception:
             pass
 
@@ -462,29 +544,29 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------------
 # 指令
 # --------------------------------------------------------------------------
-def format_stats(user: User, s: dict) -> str:
+def format_stats(user: User, s: dict, lang: str = "zh") -> str:
     event = config.current_event()
     start, end = config.event_range(event)
-    lines = [f"🏆 <b>终极聊天争霸赛</b>  {start:%d/%m} – {end:%d/%m}",
+    lines = [t(lang, "stats_title", start=f"{start:%d/%m}", end=f"{end:%d/%m}"),
              f"👤 {html.escape(user.full_name)}"]
     if s.get("disqualified"):
-        lines.append("❌ 本期资格已取消（违规发送链接 / 二维码）")
+        lines.append(t(lang, "dq_status"))
         return "\n".join(lines)
     today = s.get("today", 0)
     rank = s.get("rank")
     lines += [
-        f"⭐ 本期积分：<b>{s.get('points', 0)}</b> 分",
-        f"📊 当前排名：<b>#{rank}</b>" if rank else "📊 当前排名：未上榜",
-        f"💬 今日有效发言：{today} 条",
+        t(lang, "stats_points", p=s.get("points", 0)),
+        t(lang, "stats_rank", r=rank) if rank else t(lang, "stats_norank"),
+        t(lang, "stats_today", n=today),
     ]
     if today < 5:
-        lines.append(f"🎯 再聊 {5 - today} 条完成【5条任务】+5 分")
+        lines.append(t(lang, "stats_need5", n=5 - today))
     elif today < 10:
-        lines.append(f"🎯 再聊 {10 - today} 条完成【10条任务】+5，并解锁【全部任务】+5")
+        lines.append(t(lang, "stats_need10", n=10 - today))
     else:
-        lines.append("✅ 今日任务全部完成！继续聊天每条 +1 分（无上限）")
+        lines.append(t(lang, "stats_done"))
     if rank and rank <= config.TOP_N:
-        lines.append(f"🔥 你在 Top {config.TOP_N} 内，保持住！")
+        lines.append(t(lang, "stats_intop", n=config.TOP_N))
     return "\n".join(lines)
 
 
@@ -493,47 +575,32 @@ async def cmd_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user, msg = update.effective_user, update.effective_message
     s = await db.my_stats(config.current_event(), config.today(), user.id)
-    await reply(context, msg, format_stats(user, s), parse_mode=ParseMode.HTML)
+    await reply(context, msg, format_stats(user, s, lang_of(update)), parse_mode=ParseMode.HTML)
 
 
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str = "reply"):
     if kind == "reply" and not await player_allowed(update, context):
         return
     msg = update.effective_message
+    lang = lang_of(update)
     rows = await db.leaderboard(config.current_event(), 10)
     if not rows:
-        text = "🏆 本期还没有人上榜，快来聊天抢第一！"
+        text = t(lang, "top_empty")
     else:
         medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-        body = "\n".join(f"{medals.get(r['rank'], str(r['rank']) + '.')} {display_name(r)} — {r['points']} 分"
+        body = "\n".join(f"{medals.get(r['rank'], str(r['rank']) + '.')} {display_name(r)} — {r['points']} {t(lang, 'pts')}"
                          for r in rows)
-        text = f"🏆 <b>终极聊天争霸赛 · 实时 Top 10</b>\n\n{body}\n\n输入 /points 查看自己的分数"
+        text = f"{t(lang, 'top_title')}\n\n{body}\n\n{t(lang, 'top_footer')}"
     await reply(context, msg, text, kind=kind, parse_mode=ParseMode.HTML)
-
-
-RULES = (
-    "🏆 <b>终极聊天争霸赛 THE ULTIMATE CHAT BATTLE</b>\n"
-    "⏰ 每周一 {roll} 至下周一 {roll}，周一 {rep} 公布结果\n\n"
-    "<b>积分方式</b>\n"
-    "1. 每条有效发言 +1 分\n"
-    "2. 每天发送 5 条有效消息 +5 分\n"
-    "3. 每天发送 10 条有效消息 额外 +5 分\n"
-    "4. 完成以上全部任务 额外 +5 分\n"
-    "分数没有上限！\n\n"
-    "🎁 积分 Top {n} 各得 {prize}（需有 {turn} 流水才能领取）\n\n"
-    "✅ 和群友轻松聊天、参与讨论、分享心得\n"
-    "❌ 重复内容 / 只发表情或符号 / 单个字 / 纯数字 / 刷屏 / 转发 / 贴纸图片 不计分\n"
-    "🚫 发链接、二维码会被警告，经审核可能取消本期资格\n\n"
-    "输入 /points 查看分数，/quest 查看今日任务，/top 查看排行榜"
-)
 
 
 async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str = "reply"):
     if kind == "reply" and not await player_allowed(update, context):
         return
     await reply(context, update.effective_message,
-        RULES.format(roll=config.ROLLOVER_TIME.strftime("%H:%M"), rep=config.REPORT_TIME.strftime("%H:%M"),
-                     n=config.TOP_N, prize=config.PRIZE_TEXT, turn=config.TURNOVER_REQ),
+        t(lang_of(update), "rules", roll=config.ROLLOVER_TIME.strftime("%H:%M"),
+          rep=config.REPORT_TIME.strftime("%H:%M"), n=config.TOP_N, prize=config.PRIZE_TEXT,
+          turn=config.TURNOVER_REQ),
         kind=kind, parse_mode=ParseMode.HTML)
 
 
@@ -550,7 +617,7 @@ async def cmd_rules_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _require_admin(update: Update, context) -> bool:
     if not await is_admin(context, update.effective_chat.id, update.effective_user.id):
-        await reply(context, update.effective_message, "只有审核人员 / 管理员可以使用这个指令。")
+        await reply(context, update.effective_message, t(lang_of(update), "admin_only"))
         return False
     return True
 
@@ -574,29 +641,29 @@ async def resolve_target(update: Update, args: list[str]):
     return r["user_id"], r.get("username"), r.get("full_name"), "", None
 
 
-def format_quest(name: str, s: dict) -> str:
+def format_quest(name: str, s: dict, lang: str = "zh") -> str:
     today = s.get("today", 0)
     def box(done): return "✅" if done else "⬜"
-    lines = [f"📋 <b>今日任务</b>  {config.today():%d/%m}", f"👤 {name}", ""]
+    lines = [t(lang, "quest_title", date=f"{config.today():%d/%m}"), f"👤 {name}", ""]
     if s.get("disqualified"):
-        lines.append("❌ 本期资格已取消（违规发送链接 / 二维码）")
+        lines.append(t(lang, "dq_status"))
         return "\n".join(lines)
     lines += [
-        f"{box(today >= 1)} 有效发言  每条 +1 分（已发 {today} 条，无上限）",
-        f"{box(today >= 5)} 发满 5 条  +5 分（{min(today, 5)}/5）",
-        f"{box(today >= 10)} 发满 10 条  +5 分（{min(today, 10)}/10）",
-        f"{box(today >= 10)} 完成全部任务  +5 分",
+        t(lang, "quest_1", b=box(today >= 1), n=today),
+        t(lang, "quest_5", b=box(today >= 5), x=min(today, 5)),
+        t(lang, "quest_10", b=box(today >= 10), x=min(today, 10)),
+        t(lang, "quest_all", b=box(today >= 10)),
         "",
     ]
     earned = today + (5 if today >= 5 else 0) + (10 if today >= 10 else 0)
-    lines.append(f"⭐ 今日已得 <b>{earned}</b> 分  |  本期总分 <b>{s.get('points', 0)}</b> 分")
+    lines.append(t(lang, "quest_earned", e=earned, p=s.get("points", 0)))
     if today < 5:
-        lines.append(f"🎯 再聊 {5 - today} 条拿 +5 分")
+        lines.append(t(lang, "quest_need5", n=5 - today))
     elif today < 10:
-        lines.append(f"🎯 再聊 {10 - today} 条拿 +10 分（10条任务 + 全部完成）")
+        lines.append(t(lang, "quest_need10", n=10 - today))
     else:
-        lines.append("🔥 今日任务全部完成！继续聊天每条 +1 分")
-    lines.append("⏰ 任务每天 00:00（马来西亚时间）重置")
+        lines.append(t(lang, "quest_done"))
+    lines.append(t(lang, "quest_reset"))
     return "\n".join(lines)
 
 
@@ -609,13 +676,13 @@ async def cmd_quest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid, name = user.id, html.escape(user.full_name)
     if args or (msg.reply_to_message and msg.reply_to_message.from_user):
         if not await is_admin(context, update.effective_chat.id, user.id):
-            return await reply(context, msg, "只有管理员 / 审核人员可以查看别人的任务。")
+            return await reply(context, msg, t(lang_of(update), "quest_others_only"))
         uid, uname, fname, _, err = await resolve_target(update, args)
         if err:
             return await reply(context, msg, err if err != "missing" else "用法：/quest @username", parse_mode=ParseMode.HTML)
         name = html.escape(f"@{uname}" if uname else (fname or str(uid))) + f" (<code>{uid}</code>)"
     s = await db.my_stats(config.current_event(), config.today(), uid)
-    await reply(context, msg, format_quest(name, s), parse_mode=ParseMode.HTML)
+    await reply(context, msg, format_quest(name, s, lang_of(update)), parse_mode=ParseMode.HTML)
 
 
 async def cmd_dq(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -632,7 +699,8 @@ async def cmd_dq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reason = " ".join(args) or "manual"
     await db.disqualify(config.current_event(), uid, uname, fname, "manual", reason, snippet)
     who = f"@{uname}" if uname else (fname or "")
-    await reply(context, msg, f"❌ 已取消 {html.escape(who)} (<code>{uid}</code>) 本期资格。", kind="warning", parse_mode=ParseMode.HTML)
+    await reply(context, msg, t(lang_of(update), "dq_done", who=html.escape(who), uid=uid),
+                kind="warning", parse_mode=ParseMode.HTML)
 
 
 async def cmd_undq(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -648,8 +716,8 @@ async def cmd_undq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = await db.my_stats(config.current_event(), config.today(), uid)
     await db.undq(config.current_event(), uid)
     who = f"@{uname}" if uname else (fname or "")
-    await reply(context, msg, f"✅ 已恢复 {html.escape(who)} (<code>{uid}</code>) 本期资格，积分 {s.get('points', 0)} 分保留。",
-                         kind="warning", parse_mode=ParseMode.HTML)
+    await reply(context, msg, t(lang_of(update), "undq_done", who=html.escape(who), uid=uid, p=s.get("points", 0)),
+                kind="warning", parse_mode=ParseMode.HTML)
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -691,6 +759,9 @@ COMMAND_LIST = """📖 <b>终极聊天争霸赛 · 指令清单</b>
 /eventstart — 开始活动
 /eventend — 结束活动（停止计分，玩家指令暂停，积分保留）
 /eventstatus — 现在是开始还是结束
+/setgroup — 在新群里打，把这个群设为活动群（换群用）
+/setgroup add — 加上这个群（多个活动群，分数合并）
+/setgroup add ms — 加上这个群，用马来文（zh = 华语）
 /eventreset — 本周积分清零（要按按钮确认，会先备份名单）
 /eventreset all — 全部资料清零（测试完、正式开始前用）
 
@@ -756,7 +827,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"{'✅' if in_group else '❌'} 这个群在 GROUP_IDS 里"
                  f"\n   这个群: <code>{chat.id}</code>（{chat.type}）"
                  f"\n   GROUP_IDS: <code>{','.join(map(str, config.GROUP_IDS)) or '(空=全部群)'}</code>"
-                 + ("" if in_group else f"\n   → Railway 把 GROUP_IDS 改成 {chat.id}"))
+                 + ("" if in_group else "\n   → 审核人员在这个群打 /setgroup 就行"))
     try:
         bm = await context.bot.get_chat_member(chat.id, me.id)
         can_del = bm.status == "administrator" and bool(getattr(bm, "can_delete_messages", False))
@@ -764,6 +835,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         can_del = False
     lines.append(f"{'✅' if can_del else '⚠️'} Bot 有「删除消息」权限"
                  + ("" if can_del else "（自动删除玩家打的 /points 等指令需要这个权限；Bot 自己的回复不需要）"))
+    lines.append(f"🌐 这个群的语言：{'马来文' if lang_of(update) == 'ms' else '华语'}"
+                 "（改：/setgroup add ms 或 /setgroup add zh）")
     admin = await is_admin(context, chat.id, user.id)
     lines.append(f"{'⚠️ 你是管理员（不计分）' if admin else '✅ 你不是管理员（会计分）'}  <code>{user.id}</code>")
     try:
@@ -819,13 +892,12 @@ async def send_report(context, event, chat_id: int, announce: bool):
 
     if announce:
         medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-        body = "\n".join(f"{medals.get(r['rank'], str(r['rank']) + '.')} {mention(r['user_id'], display_name(r))} — {r['points']} 分"
-                         for r in rows)
-        text = (f"🎉 <b>终极聊天争霸赛 本期赢家出炉！</b>\n{period}\n\n{body}\n\n"
-                f"🎁 以上 Top {len(rows)} 各得 {config.PRIZE_TEXT}\n"
-                f"📌 需有 {config.TURNOVER_REQ} 流水才能领取，请自行联系客服领取奖励\n\n"
-                f"新一期已经开始，继续聊天冲榜吧！/points 查分")
         for gid in config.GROUP_IDS:
+            lang = config.GROUP_LANGS.get(gid, "zh")
+            body = "\n".join(f"{medals.get(r['rank'], str(r['rank']) + '.')} {mention(r['user_id'], display_name(r))} "
+                             f"— {r['points']} {t(lang, 'pts')}" for r in rows)
+            text = t(lang, "winners", period=period, body=body, n=len(rows),
+                     prize=config.PRIZE_TEXT, turn=config.TURNOVER_REQ)
             try:
                 await context.bot.send_message(gid, text, parse_mode=ParseMode.HTML)
             except Exception as e:
@@ -844,12 +916,12 @@ async def job_weekly_report(context: ContextTypes.DEFAULT_TYPE):
     if config.LOG_CHAT_ID and config.LOG_CHAT_ID not in targets:
         targets.append(config.LOG_CHAT_ID)
     announced = False
-    for t in targets:
+    for tgt in targets:
         try:
-            await send_report(context, event, chat_id=t, announce=EVENT_ON and not announced)
+            await send_report(context, event, chat_id=tgt, announce=EVENT_ON and not announced)
             announced = True
         except Exception as e:
-            log.warning("weekly report to %s failed（审核人员要先私讯 Bot 按 /start）: %s", t, e)
+            log.warning("weekly report to %s failed（审核人员要先私讯 Bot 按 /start）: %s", tgt, e)
 
 
 # --------------------------------------------------------------------------
@@ -858,7 +930,7 @@ def main():
 
     app.add_handler(CommandHandler(["points", "score"], cmd_points))
     # 中文也能查分：直接打「分数」「积分」「查分」
-    app.add_handler(MessageHandler(filters.Regex(r"^\s*(分数|积分|查分|我的分数|我的积分)\s*$"), cmd_points))
+    app.add_handler(MessageHandler(filters.Regex(re.compile(rf"^\s*({POINTS_WORDS})\s*$", re.IGNORECASE)), cmd_points))
     app.add_handler(CommandHandler(["top", "rank"], cmd_top))
     app.add_handler(CommandHandler("topx", cmd_top_keep))      # /topX（大小写都可以）
     app.add_handler(CommandHandler("rulesx", cmd_rules_keep))  # /rulesX
@@ -869,12 +941,14 @@ def main():
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler(["quest", "task"], cmd_quest))
-    app.add_handler(MessageHandler(filters.Regex(r"^\s*(任务|今日任务|我的任务)\s*$"), cmd_quest))
+    app.add_handler(MessageHandler(filters.Regex(re.compile(rf"^\s*({QUEST_WORDS})\s*$", re.IGNORECASE)), cmd_quest))
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler(["list", "help_admin"], cmd_list))
     app.add_handler(CommandHandler("eventstart", cmd_event_start))
     app.add_handler(CommandHandler("eventend", cmd_event_end))
     app.add_handler(CommandHandler("eventstatus", cmd_event_status))
+    app.add_handler(CommandHandler("setgroup", cmd_setgroup))
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_migrate))
     app.add_handler(CommandHandler("eventreset", cmd_event_reset))
     app.add_handler(CallbackQueryHandler(on_reset_button, pattern=r"^rst:"))
     app.add_handler(MessageHandler(

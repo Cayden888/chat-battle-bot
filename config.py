@@ -21,6 +21,19 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]      # 用 service_role key，
 GROUP_IDS = _ids("GROUP_IDS")          # 参加活动的中文群（可多个，逗号分隔）
 CS_CHAT_ID = int(os.getenv("CS_CHAT_ID", "0") or 0)     # 客服群：周一收 Top20 名单
 LOG_CHAT_ID = int(os.getenv("LOG_CHAT_ID", "0") or 0)   # 违规日志群（可与客服群相同）
+# 每个群用哪种语言：zh = 华语，ms = 马来文（没写的群默认华语）
+# 也可以在群里打 /setgroup add ms 或 /setgroup add zh 来设定，会存在 Supabase
+def _langs(raw: str) -> dict[int, str]:
+    out = {}
+    for part in raw.replace(" ", "").split(","):
+        if ":" in part:
+            gid, lang = part.rsplit(":", 1)
+            if gid.lstrip("-").isdigit() and lang in ("zh", "ms"):
+                out[int(gid)] = lang
+    return out
+
+
+GROUP_LANGS = _langs(os.getenv("GROUP_LANGS", "-1004398257314:zh,-1003974610649:ms"))
 REVIEWER_IDS = _ids("REVIEWER_IDS") or {8875069703}   # 违规审核人员（默认 @nicolenicola），私讯收违规报告
 ADMIN_IDS = _ids("ADMIN_IDS")          # 额外管理员（群管理员自动算）
 
