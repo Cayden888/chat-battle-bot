@@ -49,7 +49,7 @@ TURNOVER_REQ = os.getenv("TURNOVER_REQ", "1000")
 
 MIN_INTERVAL_SEC = int(os.getenv("MIN_INTERVAL_SEC", "3"))   # 两条有效发言最少间隔
 NEWBIE_THRESHOLD = int(os.getenv("NEWBIE_THRESHOLD", "5"))   # 历史有效发言 < 这个数 + 发Link = 报告里标注「疑似钓鱼」
-QR_CHECK = os.getenv("QR_CHECK", "1") == "1"
+QR_CHECK = os.getenv("QR_CHECK", "0") == "1"   # 0 = 发二维码不警告（只是不计分）；1 = 二维码也当违规警告
 
 ANNOUNCE_EVENT_SWITCH = os.getenv("ANNOUNCE_EVENT_SWITCH", "1") == "1"   # /eventstart /eventend 时在活动群发公告（0 = 不发）
 

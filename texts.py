@@ -44,8 +44,8 @@ T = {
     # ---- /points ----
     "stats_title": {"zh": "🏆 <b>终极聊天争霸赛</b>  {start} – {end}", "ms": "🏆 <b>THE ULTIMATE CHAT BATTLE</b>  {start} – {end}"},
     "dq_status": {
-        "zh": "❌ 本期资格已取消（违规发送链接 / 二维码）",
-        "ms": "❌ Kelayakan anda minggu ini telah dibatalkan (menghantar pautan / kod QR)",
+        "zh": "❌ 本期资格已取消（违规发送链接）",
+        "ms": "❌ Kelayakan anda minggu ini telah dibatalkan (menghantar pautan)",
     },
     "stats_points": {"zh": "⭐ 本期积分：<b>{p}</b> 分", "ms": "⭐ Mata minggu ini: <b>{p}</b>"},
     "stats_rank": {"zh": "📊 当前排名：<b>#{r}</b>", "ms": "📊 Kedudukan semasa: <b>#{r}</b>"},
@@ -88,7 +88,7 @@ T = {
             "🎁 积分 Top {n} 各得 {prize}（需有 {turn} 流水才能领取）\n\n"
             "✅ 和群友轻松聊天、参与讨论、分享心得\n"
             "❌ 重复内容 / 只发表情或符号 / 单个字 / 纯数字 / 刷屏 / 转发 / 贴纸图片 不计分\n"
-            "🚫 发链接、二维码会被警告，经审核可能取消本期资格\n\n"
+            "🚫 发链接会被警告，经审核可能取消本期资格\n\n"
             "输入 /points 查看分数，/quest 查看今日任务，/top 查看排行榜"
         ),
         "ms": (
@@ -104,7 +104,7 @@ T = {
             "✅ Berbual santai, sertai perbincangan, kongsi pengalaman\n"
             "❌ Tidak dikira: kandungan berulang / emoji atau simbol sahaja / satu huruf / nombor sahaja / "
             "spam / mesej forward / sticker atau gambar\n"
-            "🚫 Hantar pautan atau kod QR akan diberi amaran, dan kelayakan mungkin dibatalkan selepas semakan\n\n"
+            "🚫 Hantar pautan akan diberi amaran, dan kelayakan mungkin dibatalkan selepas semakan\n\n"
             "Taip /points untuk mata, /quest untuk misi hari ini, /top untuk carta"
         ),
     },
