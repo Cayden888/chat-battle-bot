@@ -312,6 +312,43 @@ async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 kind="keep", parse_mode=ParseMode.HTML)
 
 
+async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """审核人员看现在绑定了哪些活动群（名字、ID、语言、Bot 权限）"""
+    if not await _require_admin(update, context):
+        return
+    if not config.GROUP_IDS:
+        return await reply(context, update.effective_message,
+                           "⚠️ 还没有绑定活动群（现在所有群都会计分）。\n在活动群里打 /setgroup 绑定。", kind="keep")
+    me = await context.bot.get_me()
+    names = {"zh": "华语", "ms": "马来文"}
+    lines = [f"📌 <b>已绑定的活动群（{len(config.GROUP_IDS)}）</b>", ""]
+    for gid in sorted(config.GROUP_IDS):
+        try:
+            c = await context.bot.get_chat(gid)
+            title = html.escape(c.title or str(gid))
+            try:
+                m = await context.bot.get_chat_member(gid, me.id)
+                if m.status == "administrator" and getattr(m, "can_delete_messages", False):
+                    perm = "✅ 管理员（可删消息）"
+                elif m.status == "administrator":
+                    perm = "⚠️ 管理员，但没有「删除消息」权限"
+                elif m.status in ("left", "kicked"):
+                    perm = "❌ Bot 不在群里"
+                else:
+                    perm = "⚠️ 不是管理员（玩家的指令删不掉）"
+            except Exception:
+                perm = "❓ 查不到权限"
+        except Exception:
+            title, perm = "（读不到群资料）", "❌ Bot 可能不在这个群，或群 ID 已变"
+        lines += [f"<b>{title}</b>",
+                  f"   ID：<code>{gid}</code>",
+                  f"   语言：{names.get(config.GROUP_LANGS.get(gid, 'zh'))}",
+                  f"   Bot：{perm}", ""]
+    lines.append(f"活动状态：{'✅ 进行中' if EVENT_ON else '⏸ 已结束'}")
+    lines.append("改：在群里打 /setgroup（只用这个群）或 /setgroup add ms / zh（加上）")
+    await reply(context, update.effective_message, "\n".join(lines), kind="keep", parse_mode=ParseMode.HTML)
+
+
 async def on_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """普通群被升级成超级群时，Telegram 会换一个新的群 ID —— 自动把活动群换成新 ID。"""
     msg = update.effective_message
@@ -759,6 +796,7 @@ COMMAND_LIST = """📖 <b>终极聊天争霸赛 · 指令清单</b>
 /eventstart — 开始活动
 /eventend — 结束活动（停止计分，玩家指令暂停，积分保留）
 /eventstatus — 现在是开始还是结束
+/groups — 看现在绑定了哪些活动群（名字、ID、语言、Bot 权限）
 /setgroup — 在新群里打，把这个群设为活动群（换群用）
 /setgroup add — 加上这个群（多个活动群，分数合并）
 /setgroup add ms — 加上这个群，用马来文（zh = 华语）
@@ -948,6 +986,7 @@ def main():
     app.add_handler(CommandHandler("eventend", cmd_event_end))
     app.add_handler(CommandHandler("eventstatus", cmd_event_status))
     app.add_handler(CommandHandler("setgroup", cmd_setgroup))
+    app.add_handler(CommandHandler("groups", cmd_groups))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_migrate))
     app.add_handler(CommandHandler("eventreset", cmd_event_reset))
     app.add_handler(CallbackQueryHandler(on_reset_button, pattern=r"^rst:"))
