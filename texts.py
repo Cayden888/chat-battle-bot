@@ -25,11 +25,30 @@ T = {
     "label_link": {"zh": "发送链接", "ms": "hantar pautan"},
     "label_qr": {"zh": "发送二维码", "ms": "hantar kod QR"},
     "warning": {
-        "zh": "⚠️ {name} 请勿在群内{label}。\n这违反了【终极聊天争霸赛】规则，已提交管理员审核，"
-              "可能会被取消本期活动资格。（本期第 {n} 次警告）",
-        "ms": "⚠️ {name}, jangan {label} dalam grup.\nIni melanggar peraturan THE ULTIMATE CHAT BATTLE dan telah "
-              "dihantar kepada admin untuk semakan. Kelayakan anda minggu ini mungkin dibatalkan. (Amaran ke-{n} minggu ini)",
+        "zh": "⚠️ {name} 请勿在群内{label}。\n这违反了【终极聊天争霸赛】规则（{count}）。{penalty}\n"
+              "已提交管理员审核，可能会被取消本期活动资格。",
+        "ms": "⚠️ {name}, jangan {label} dalam grup.\nIni melanggar peraturan THE ULTIMATE CHAT BATTLE ({count}).{penalty}\n"
+              "Perkara ini telah dihantar kepada admin untuk semakan. Kelayakan anda minggu ini mungkin dibatalkan.",
     },
+    "warn_count_all": {"zh": "第 {n} 次警告", "ms": "amaran ke-{n}"},
+    "warn_count_week": {"zh": "本周第 {n} 次警告", "ms": "amaran ke-{n} minggu ini"},
+    "mute_for": {
+        "zh": "\n🔇 已禁言 {dur}，时间到会自动恢复。",
+        "ms": "\n🔇 Anda disekat daripada menghantar mesej selama {dur}. Sekatan akan ditarik balik secara automatik.",
+    },
+    "mute_perm": {
+        "zh": "\n🔇 已永久禁言：仍然可以看群，但不能发言。",
+        "ms": "\n🔇 Anda disekat daripada menghantar mesej secara kekal: masih boleh lihat grup, tetapi tidak boleh berbual.",
+    },
+    "dur_h": {"zh": "{n} 小时", "ms": "{n} jam"},
+    "dur_d": {"zh": "{n} 天", "ms": "{n} hari"},
+    "dur_perm": {"zh": "永久禁言（可看群）", "ms": "sekatan kekal (masih boleh lihat grup)"},
+    "mute_rule": {
+        "zh": "🚫 发链接会被警告并禁言：{steps}\n\n",
+        "ms": "🚫 Hantar pautan akan diberi amaran dan disekat: {steps}\n\n",
+    },
+    "nth": {"zh": "第 {n} 次 {d}", "ms": "kali ke-{n} {d}"},
+    "nth_more": {"zh": "之后每次 {d}", "ms": "seterusnya {d}"},
 
     # ---- 恭喜 ----
     "congrats5": {
@@ -88,7 +107,7 @@ T = {
             "🎁 积分 Top {n} 各得 {prize}（需有 {turn} 流水才能领取）\n\n"
             "✅ 和群友轻松聊天、参与讨论、分享心得\n"
             "❌ 重复内容 / 只发表情或符号 / 单个字 / 纯数字 / 刷屏 / 转发 / 贴纸图片 不计分\n"
-            "🚫 发链接会被警告，经审核可能取消本期资格\n\n"
+            "{mute_rule}"
             "输入 /points 查看分数，/quest 查看今日任务，/top 查看排行榜"
         ),
         "ms": (
@@ -104,7 +123,7 @@ T = {
             "✅ Berbual santai, sertai perbincangan, kongsi pengalaman\n"
             "❌ Tidak dikira: kandungan berulang / emoji atau simbol sahaja / satu huruf / nombor sahaja / "
             "spam / mesej forward / sticker atau gambar\n"
-            "🚫 Hantar pautan akan diberi amaran, dan kelayakan mungkin dibatalkan selepas semakan\n\n"
+            "{mute_rule}"
             "Taip /points untuk mata, /quest untuk misi hari ini, /top untuk carta"
         ),
     },

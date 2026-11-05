@@ -10,7 +10,7 @@ import re
 import time as _time
 from datetime import datetime, timedelta
 
-from telegram import Update, Message, User, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, Message, User, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.constants import ParseMode, ChatType
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
@@ -143,6 +143,7 @@ async def reply(context, msg: Message, text: str, kind: str = "reply", **kw):
 # 状态存在 Supabase（cb_settings），Bot 重启也会记得
 # --------------------------------------------------------------------------
 EVENT_ON = True
+STAFF_IDS: set[int] = set()   # 客服 / 工作人员：不计分、不上榜、发链接不警告（/staff 管理，存在 Supabase）
 
 
 async def load_event_state(app=None):
@@ -161,6 +162,11 @@ async def load_event_state(app=None):
             config.GROUP_IDS.update(int(x) for x in saved.split(",") if x.strip())
     except Exception as e:
         log.warning("读取活动群设定失败，使用 Railway 的 GROUP_IDS: %s", e)
+    try:
+        STAFF_IDS.clear()
+        STAFF_IDS.update(int(x) for x in (await db.get_setting("staff_ids", "") or "").split(",") if x.strip())
+    except Exception as e:
+        log.warning("读取工作人员名单失败: %s", e)
     try:
         saved_langs = await db.get_setting("group_langs")
         if saved_langs:
@@ -328,10 +334,11 @@ async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title = html.escape(c.title or str(gid))
             try:
                 m = await context.bot.get_chat_member(gid, me.id)
-                if m.status == "administrator" and getattr(m, "can_delete_messages", False):
-                    perm = "✅ 管理员（可删消息）"
-                elif m.status == "administrator":
-                    perm = "⚠️ 管理员，但没有「删除消息」权限"
+                if m.status == "administrator":
+                    can_del = getattr(m, "can_delete_messages", False)
+                    can_mute = getattr(m, "can_restrict_members", False)
+                    perm = (f"管理员  {'✅' if can_del else '❌'} 删除消息  "
+                            f"{'✅' if can_mute else '❌'} 封禁用户（禁言要用）")
                 elif m.status in ("left", "kicked"):
                     perm = "❌ Bot 不在群里"
                 else:
@@ -398,38 +405,111 @@ def message_link(chat, message_id: int) -> str | None:
     return None
 
 
+# ---- 禁言阶梯（config.MUTE_STEPS，例：1d,7d,perm）----
+def _step_for(n: int) -> str | None:
+    """第 n 次警告要禁言多久：'2h' / '1d' / 'perm' / None（不禁言）"""
+    if not config.MUTE_STEPS or n < 1:
+        return None
+    return config.MUTE_STEPS[min(n, len(config.MUTE_STEPS)) - 1]
+
+
+def _step_seconds(step: str) -> int | None:
+    """None = 永久"""
+    if step == "perm":
+        return None
+    num, unit = int(step[:-1]), step[-1]
+    return num * (3600 if unit == "h" else 86400)
+
+
+def _dur_text(lang: str, step: str) -> str:
+    if step == "perm":
+        return t(lang, "dur_perm")
+    return t(lang, "dur_h" if step.endswith("h") else "dur_d", n=int(step[:-1]))
+
+
+def mute_rule_text(lang: str) -> str:
+    """/rules 里那一行：第 1 次 1 天、第 2 次 7 天、之后每次 永久禁言"""
+    if not config.MUTE_STEPS:
+        return t(lang, "mute_rule", steps="-")
+    parts = [t(lang, "nth", n=i + 1, d=_dur_text(lang, st)) for i, st in enumerate(config.MUTE_STEPS)]
+    if config.MUTE_STEPS[-1] != "perm":
+        parts.append(t(lang, "nth_more", d=_dur_text(lang, config.MUTE_STEPS[-1])))
+    return t(lang, "mute_rule", steps=("、" if lang == "zh" else ", ").join(parts))
+
+
+async def mute_user(context, chat_id: int, user_id: int, step: str) -> tuple[bool, str]:
+    """禁言（还在群里、看得到消息，只是不能发言）。返回 (成功?, 失败原因)"""
+    secs = _step_seconds(step)
+    until = None if secs is None else datetime.now(config.TZ) + timedelta(seconds=secs)
+    try:
+        await context.bot.restrict_chat_member(chat_id, user_id, permissions=ChatPermissions.no_permissions(),
+                                               until_date=until)
+        return True, ""
+    except Exception as e:
+        log.warning("mute %s in %s failed: %s", user_id, chat_id, e)
+        return False, str(e)
+
+
+async def unmute_user(context, chat_id: int, user_id: int) -> tuple[bool, str]:
+    try:
+        await context.bot.restrict_chat_member(chat_id, user_id, permissions=ChatPermissions.all_permissions())
+        return True, ""
+    except Exception as e:
+        log.warning("unmute %s in %s failed: %s", user_id, chat_id, e)
+        return False, str(e)
+
+
 async def flag_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str, snippet: str):
-    """不删消息、不 Ban、不自动取消资格：
-    1) 在群里发警告  2) 把详情 + 原因私讯给审核人员，由审核人员按按钮决定。"""
+    """发链接：记一次警告 → 按次数禁言（1 天 / 7 天 / 永久）→ 群里警告（2 小时后删）→ 私讯审核人员。
+    不删玩家的消息、不踢人、不自动取消资格。"""
     msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
     event = config.current_event()
     label, why = REASONS.get(kind, (kind, "违反活动规则。"))
     name = mention(user.id, html.escape(user.full_name))
     lang = lang_of(update)
+    week_scope = config.WARN_COUNT_SCOPE == "week"
 
     try:
-        warn_count = await db.flag(event, user.id, user.username, user.full_name, kind, snippet)
+        await db.flag(event, user.id, user.username, user.full_name, kind, snippet)
+        warn_count = await db.warn_count(user.id, event if week_scope else None)
         history = await db.lifetime_valid(user.id)
         stats = await db.my_stats(event, config.today(), user.id)
     except Exception as e:
         log.exception("flag failed: %s", e)
         warn_count, history, stats = 1, 0, {}
 
-    # 1) 群警告（记住这条警告的位置，审核人员按「忽略」时会把它删掉）
-    warn_ref = ""
+    # 1) 禁言
+    step = _step_for(warn_count)
+    muted, mute_err = (await mute_user(context, chat.id, user.id, step)) if step else (False, "")
+    if muted:
+        penalty = t(lang, "mute_perm") if step == "perm" else t(lang, "mute_for", dur=_dur_text(lang, step))
+    else:
+        penalty = ""
+
+    # 2) 群警告（2 小时后自动删；审核人员按「忽略」也会删）
+    count_txt = t(lang, "warn_count_week" if week_scope else "warn_count_all", n=warn_count)
+    warn_mid = 0
     try:
         wm = await reply(context, msg,
-            t(lang, "warning", name=name, label=t(lang, f"label_{kind}"), n=warn_count),
+            t(lang, "warning", name=name, label=t(lang, f"label_{kind}"), count=count_txt, penalty=penalty),
             kind="warning", parse_mode=ParseMode.HTML)
-        warn_ref = f":{wm.chat_id}:{wm.message_id}"
+        warn_mid = wm.message_id
     except Exception as e:
         log.warning("group warning failed: %s", e)
+    warn_ref = f":{chat.id}:{warn_mid}"
 
-    # 2) 私讯审核人员
+    # 3) 私讯审核人员
     link = message_link(chat, msg.message_id)
     hint = ""
     if history < config.NEWBIE_THRESHOLD:
-        hint = f"\n🎣 <b>疑似钓鱼号</b>：之前只有 {history} 条有效发言就{label}，建议管理员在群里手动处理。"
+        hint = f"\n🎣 <b>疑似钓鱼号</b>：之前只有 {history} 条有效发言就{label}。"
+    if muted:
+        pen_line = f"🔇 已自动禁言：{_dur_text('zh', step)}"
+    elif step:
+        pen_line = ("⚠️ <b>禁言失败</b>：Bot 需要群管理员的「封禁用户 / 限制成员」权限"
+                    f"\n   <code>{html.escape(mute_err[:120])}</code>")
+    else:
+        pen_line = "🔇 没有设定禁言（MUTE_STEPS 是空的）"
     status = "（已被取消资格）" if stats.get("disqualified") else ""
     report = (
         f"🚨 <b>终极聊天争霸赛 · 违规审核</b>\n\n"
@@ -438,14 +518,15 @@ async def flag_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, kin
         f"🔗 Username：@{html.escape(user.username) if user.username else '-'}\n"
         f"👥 群：{html.escape(chat.title or str(chat.id))}\n"
         f"⭐ 本期积分：{stats.get('points', 0)} 分  |  排名：{('#' + str(stats['rank'])) if stats.get('rank') else '未上榜'}\n"
-        f"🔁 本期违规次数：{warn_count}\n\n"
+        f"🔁 {'本周' if week_scope else '累计'}违规次数：{warn_count}\n"
+        f"{pen_line}\n\n"
         f"❗ <b>为什么可能被取消资格：</b>\n{why}{hint}\n\n"
         f"📝 内容：<code>{html.escape((snippet or '')[:300])}</code>"
         + (f'\n📎 <a href="{link}">查看原消息</a>' if link else "")
     )
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("❌ 取消本期资格", callback_data=f"dq:{event:%Y%m%d}:{user.id}{warn_ref}"),
-        InlineKeyboardButton("✅ 忽略", callback_data=f"ok:{event:%Y%m%d}:{user.id}{warn_ref}"),
+        InlineKeyboardButton("✅ 忽略（解除禁言）", callback_data=f"ok:{event:%Y%m%d}:{user.id}{warn_ref}"),
     ]])
     targets = list(config.REVIEWER_IDS) + ([config.LOG_CHAT_ID] if config.LOG_CHAT_ID else [])
     for tgt in targets:
@@ -477,14 +558,22 @@ async def on_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("已取消资格")
     else:
         result = f"\n\n✅ <b>已忽略</b> — {html.escape(who)}"
-        # 忽略 = 不算违规，把群里那条 ⚠️ 警告删掉
+        # 忽略 = 不算违规：这次警告不算次数 + 解除禁言 + 删群里的警告
+        try:
+            await db.unflag(uid)
+            result += "\n↩️ 这次警告不算次数"
+        except Exception as e:
+            log.warning("unflag failed: %s", e)
+        if warn_chat:
+            ok_, err_ = await unmute_user(context, warn_chat, uid)
+            result += "\n🔊 已解除禁言" if ok_ else f"\n⚠️ 解除禁言失败：<code>{html.escape(err_[:100])}</code>"
         if warn_chat and warn_msg:
             try:
                 await context.bot.delete_message(warn_chat, warn_msg)
                 result += "\n🗑 群里的警告已删除"
             except Exception as e:
                 log.warning("delete warning failed: %s", e)
-                result += "\n⚠️ 群里的警告删不掉（可能已被删除，或超过 48 小时），请手动删除"
+                result += "\n🗑 群里的警告已经不在了（2 小时后会自动删除）"
         await q.answer("已忽略")
     try:
         await q.edit_message_text(q.message.text_html + result, parse_mode=ParseMode.HTML,
@@ -538,9 +627,9 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = msg.text or msg.caption or ""
     entities = (msg.entities or ()) + (msg.caption_entities or ())
-    admin = await is_admin(context, msg.chat_id, user.id)
+    admin = user.id in STAFF_IDS or await is_admin(context, msg.chat_id, user.id)
 
-    # 1) Link / QR —— 管理员豁免
+    # 1) Link / QR —— 管理员 / 工作人员豁免
     if not admin:
         if has_link(text, entities):
             return await flag_violation(update, context, "link", text)
@@ -637,7 +726,7 @@ async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: st
     await reply(context, update.effective_message,
         t(lang_of(update), "rules", roll=config.ROLLOVER_TIME.strftime("%H:%M"),
           rep=config.REPORT_TIME.strftime("%H:%M"), n=config.TOP_N, prize=config.PRIZE_TEXT,
-          turn=config.TURNOVER_REQ),
+          turn=config.TURNOVER_REQ, mute_rule=mute_rule_text(lang_of(update))),
         kind=kind, parse_mode=ParseMode.HTML)
 
 
@@ -722,6 +811,103 @@ async def cmd_quest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(context, msg, format_quest(name, s, lang_of(update)), parse_mode=ParseMode.HTML)
 
 
+async def _save_staff(by=None):
+    await db.set_setting("staff_ids", ",".join(str(x) for x in sorted(STAFF_IDS)), by)
+
+
+async def cmd_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/staff @username（或回复他的消息 / user_id）→ 加进工作人员名单：不计分、不上榜、发链接不警告。
+    本周已有的分数会被移出排行榜。"""
+    if not await _require_admin(update, context):
+        return
+    msg = update.effective_message
+    uid, uname, fname, _, err = await resolve_target(update, list(context.args))
+    if err == "missing":
+        return await reply(context, msg, "用法：/staff @username\n或 /staff <user_id>\n或在群里回复他的消息打 /staff", kind="keep")
+    if err:
+        return await reply(context, msg, err, kind="keep", parse_mode=ParseMode.HTML)
+    STAFF_IDS.add(uid)
+    await _save_staff(update.effective_user.id)
+    # 本周已经拿的分数：移出排行榜（用取消资格的方式，名单里不会出现）
+    await db.disqualify(config.current_event(), uid, uname, fname, "staff", "staff", "")
+    who = html.escape(f"@{uname}" if uname else (fname or str(uid)))
+    await reply(context, msg, f"✅ {who} (<code>{uid}</code>) 已加进工作人员名单：不计分、不上榜、发链接不警告。\n"
+                f"本周已有的分数已移出排行榜。", kind="keep", parse_mode=ParseMode.HTML)
+
+
+async def cmd_unstaff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_admin(update, context):
+        return
+    msg = update.effective_message
+    uid, uname, fname, _, err = await resolve_target(update, list(context.args))
+    if err == "missing":
+        return await reply(context, msg, "用法：/unstaff @username 或 /unstaff <user_id>", kind="keep")
+    if err:
+        return await reply(context, msg, err, kind="keep", parse_mode=ParseMode.HTML)
+    STAFF_IDS.discard(uid)
+    await _save_staff(update.effective_user.id)
+    await db.undq(config.current_event(), uid)
+    who = html.escape(f"@{uname}" if uname else (fname or str(uid)))
+    await reply(context, msg, f"✅ {who} (<code>{uid}</code>) 已移出工作人员名单，从现在起会正常计分。",
+                kind="keep", parse_mode=ParseMode.HTML)
+
+
+async def cmd_stafflist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_admin(update, context):
+        return
+    if not STAFF_IDS:
+        return await reply(context, update.effective_message,
+                           "工作人员名单是空的。\n用 /staff @username 加人（群管理员和审核人员本来就不计分，不用加）。", kind="keep")
+    lines = [f"👔 <b>工作人员名单（{len(STAFF_IDS)}）</b>— 不计分、不上榜、发链接不警告", ""]
+    for uid in sorted(STAFF_IDS):
+        try:
+            c = await context.bot.get_chat(uid)
+            name = html.escape(("@" + c.username) if c.username else (c.full_name or ""))
+        except Exception:
+            name = ""
+        lines.append(f"• {name} <code>{uid}</code>")
+    lines.append("\n移除：/unstaff @username")
+    await reply(context, update.effective_message, "\n".join(lines), kind="keep", parse_mode=ParseMode.HTML)
+
+
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unmute @username：解除禁言（在群里打 = 这个群；私讯 Bot 打 = 所有活动群）。不会清警告次数。"""
+    if not await _require_admin(update, context):
+        return
+    msg, chat = update.effective_message, update.effective_chat
+    uid, uname, fname, _, err = await resolve_target(update, list(context.args))
+    if err == "missing":
+        return await reply(context, msg, "用法：/unmute @username 或 /unmute <user_id>，或在群里回复他的消息打 /unmute", kind="keep")
+    if err:
+        return await reply(context, msg, err, kind="keep", parse_mode=ParseMode.HTML)
+    groups = [chat.id] if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) else sorted(config.GROUP_IDS)
+    lines = []
+    for g in groups:
+        ok_, e = await unmute_user(context, g, uid)
+        lines.append(f"{'✅' if ok_ else '❌'} <code>{g}</code>" + ("" if ok_ else f" {html.escape(e[:80])}"))
+    who = html.escape(f"@{uname}" if uname else (fname or str(uid)))
+    cnt = await db.warn_count(uid, None)
+    await reply(context, msg, f"🔊 {who} (<code>{uid}</code>) 解除禁言：\n" + "\n".join(lines)
+                + f"\n\n警告次数还是 {cnt} 次（要清零：/resetwarn {('@' + uname) if uname else uid}）",
+                kind="keep", parse_mode=ParseMode.HTML)
+
+
+async def cmd_resetwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/resetwarn @username：警告次数清零（下次再犯又从第 1 次算起）"""
+    if not await _require_admin(update, context):
+        return
+    msg = update.effective_message
+    uid, uname, fname, _, err = await resolve_target(update, list(context.args))
+    if err == "missing":
+        return await reply(context, msg, "用法：/resetwarn @username 或 /resetwarn <user_id>", kind="keep")
+    if err:
+        return await reply(context, msg, err, kind="keep", parse_mode=ParseMode.HTML)
+    n = await db.clear_warns(uid)
+    who = html.escape(f"@{uname}" if uname else (fname or str(uid)))
+    await reply(context, msg, f"✅ {who} (<code>{uid}</code>) 的警告次数已清零（清掉 {n} 次）。\n"
+                f"禁言不会自动解除，需要的话打 /unmute。", kind="keep", parse_mode=ParseMode.HTML)
+
+
 async def cmd_dq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """取消资格：回复玩家消息 /dq 原因，或 /dq <user_id 或 @username> 原因"""
     if not await _require_admin(update, context):
@@ -737,7 +923,7 @@ async def cmd_dq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.disqualify(config.current_event(), uid, uname, fname, "manual", reason, snippet)
     who = f"@{uname}" if uname else (fname or "")
     await reply(context, msg, t(lang_of(update), "dq_done", who=html.escape(who), uid=uid),
-                kind="warning", parse_mode=ParseMode.HTML)
+                kind="keep", parse_mode=ParseMode.HTML)
 
 
 async def cmd_undq(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -754,7 +940,7 @@ async def cmd_undq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.undq(config.current_event(), uid)
     who = f"@{uname}" if uname else (fname or "")
     await reply(context, msg, t(lang_of(update), "undq_done", who=html.escape(who), uid=uid, p=s.get("points", 0)),
-                kind="warning", parse_mode=ParseMode.HTML)
+                kind="keep", parse_mode=ParseMode.HTML)
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -803,6 +989,17 @@ COMMAND_LIST = """📖 <b>终极聊天争霸赛 · 指令清单</b>
 /eventreset — 本周积分清零（要按按钮确认，会先备份名单）
 /eventreset all — 全部资料清零（测试完、正式开始前用）
 
+<u>工作人员（客服等）</u>
+/staff @username — 加进名单：不计分、不上榜、发链接不警告（永久）
+/unstaff @username — 移出名单
+/stafflist — 看名单
+<i>群管理员和审核人员本来就不计分，不用加</i>
+
+<u>禁言（发链接自动禁言：第 1 次 1 天、第 2 次 7 天、第 3 次永久，可看群）</u>
+/unmute @username — 解除禁言（私讯 Bot 打 = 所有活动群）
+/resetwarn @username — 警告次数清零
+<i>违规报告按「✅ 忽略」= 解除禁言 + 这次不算次数 + 删警告</i>
+
 <u>资格</u>
 /dq @username 原因 — 取消本期资格
 /undq @username — 恢复资格（积分保留）
@@ -826,7 +1023,8 @@ COMMAND_LIST = """📖 <b>终极聊天争霸赛 · 指令清单</b>
 
 <b>🚨 违规报告按钮</b>
 ❌ 取消本期资格 — 警告保留在群里
-✅ 忽略 — 自动删除群里的警告
+✅ 忽略 — 解除禁言、这次不算次数、删除群里的警告
+（群警告本身 2 小时后自动删除）
 
 <b>⏰ 自动</b>
 每周一 10:30 换期（新一周从 0 分开始，旧资料保留）
@@ -869,10 +1067,13 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bm = await context.bot.get_chat_member(chat.id, me.id)
         can_del = bm.status == "administrator" and bool(getattr(bm, "can_delete_messages", False))
+        can_mute = bm.status == "administrator" and bool(getattr(bm, "can_restrict_members", False))
     except Exception:
-        can_del = False
+        can_del = can_mute = False
     lines.append(f"{'✅' if can_del else '⚠️'} Bot 有「删除消息」权限"
                  + ("" if can_del else "（自动删除玩家打的 /points 等指令需要这个权限；Bot 自己的回复不需要）"))
+    lines.append(f"{'✅' if can_mute else '❌'} Bot 有「封禁用户」权限"
+                 + ("" if can_mute else "（发链接禁言需要这个权限）"))
     lines.append(f"🌐 这个群的语言：{'马来文' if lang_of(update) == 'ms' else '华语'}"
                  "（改：/setgroup add ms 或 /setgroup add zh）")
     admin = await is_admin(context, chat.id, user.id)
@@ -987,6 +1188,11 @@ def main():
     app.add_handler(CommandHandler("eventstatus", cmd_event_status))
     app.add_handler(CommandHandler("setgroup", cmd_setgroup))
     app.add_handler(CommandHandler("groups", cmd_groups))
+    app.add_handler(CommandHandler("staff", cmd_staff))
+    app.add_handler(CommandHandler("unmute", cmd_unmute))
+    app.add_handler(CommandHandler("resetwarn", cmd_resetwarn))
+    app.add_handler(CommandHandler("unstaff", cmd_unstaff))
+    app.add_handler(CommandHandler("stafflist", cmd_stafflist))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_migrate))
     app.add_handler(CommandHandler("eventreset", cmd_event_reset))
     app.add_handler(CallbackQueryHandler(on_reset_button, pattern=r"^rst:"))

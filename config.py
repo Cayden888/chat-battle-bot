@@ -57,9 +57,17 @@ ANNOUNCE_EVENT_SWITCH = os.getenv("ANNOUNCE_EVENT_SWITCH", "1") == "1"   # /even
 # 以后要改时间：去 Railway → Variables 改这几个值，不用改代码
 CONGRATS_DELETE_SEC = int(os.getenv("CONGRATS_DELETE_SEC", "30"))   # 恭喜完成 5条 / 10条任务
 REPLY_DELETE_SEC = int(os.getenv("REPLY_DELETE_SEC", "20"))         # /points /quest /top /rules /id /debug 等指令的回复
-WARNING_DELETE_SEC = int(os.getenv("WARNING_DELETE_SEC", "0"))      # 违规警告 + /dq /undq 结果（默认 0 = 保留，方便之后回复他 unban）
+WARNING_DELETE_SEC = int(os.getenv("WARNING_DELETE_SEC", "7200"))   # 发链接的群警告：默认 2 小时后删除（7200 秒）
 DELETE_COMMAND_MSG = os.getenv("DELETE_COMMAND_MSG", "1") == "1"    # 1 = 玩家打的 /points、分数 等指令也在 REPLY_DELETE_SEC 后删掉（Bot 需要管理员「删除消息」权限）；0 = 不删
-# 不会自动删除：/topX /rulesX 的回复、周一赢家公告、客服群名单、私讯给审核人员的报告、私聊 Bot 的回复
+# 不会自动删除：/dq /undq 的结果、/topX /rulesX 的回复、周一赢家公告、客服群名单、私讯给审核人员的报告、私聊 Bot 的回复
+
+
+# ===== 发链接的禁言阶梯 =====
+# 第 1 次、第 2 次、第 3 次…… 用逗号隔开；h = 小时，d = 天，perm = 永久禁言（还能看群，不能发言）
+# 超过的次数都用最后一个。设成空的 = 只警告，不禁言
+MUTE_STEPS = [x.strip().lower() for x in os.getenv("MUTE_STEPS", "1d,7d,perm").split(",") if x.strip()]
+# 警告次数怎么算：all = 历史累计（推荐）；week = 每周一重新算
+WARN_COUNT_SCOPE = os.getenv("WARN_COUNT_SCOPE", "all").lower()
 
 
 def now() -> datetime:

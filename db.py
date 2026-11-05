@@ -100,3 +100,16 @@ async def set_setting(key: str, value: str, by: int | None = None):
 
 async def reset(event: date, all_weeks: bool = False) -> dict:
     return await rpc("cb_reset", {"p_event": event.isoformat(), "p_all": all_weeks}) or {}
+
+
+async def warn_count(user_id: int, event: date | None = None) -> int:
+    return await rpc("cb_warn_count", {"p_user": user_id,
+                                       "p_event": event.isoformat() if event else None}) or 0
+
+
+async def unflag(user_id: int):
+    await rpc("cb_unflag", {"p_user": user_id})
+
+
+async def clear_warns(user_id: int) -> int:
+    return await rpc("cb_clear_warns", {"p_user": user_id}) or 0
