@@ -285,3 +285,94 @@ grant execute on function cb_flag(date, bigint, text, text, text, text)         
 grant execute on function cb_undq(date, bigint)                                          to service_role;
 grant execute on function cb_leaderboard(date, int)                                      to service_role;
 grant execute on function cb_my_stats(date, date, bigint)                                to service_role;
+
+-- Bot（service_role）读写表的权限。新版 Supabase 项目不一定自动给，这里明确给一次
+grant usage on schema public to service_role;
+grant select, insert, update, delete on cb_users, cb_event_users, cb_daily, cb_msg_hashes, cb_violations to service_role;
+grant usage, select on sequence cb_violations_id_seq to service_role;
+
+
+-- =====================================================================
+-- 活动开关（/eventstart /eventend）—— 新增，跑这段即可
+-- =====================================================================
+create table if not exists cb_settings (
+  key         text primary key,
+  value       text,
+  updated_by  bigint,
+  updated_at  timestamptz not null default now()
+);
+alter table cb_settings enable row level security;
+grant select, insert, update, delete on cb_settings to service_role;
+
+
+-- =====================================================================
+-- 一键清零（/eventreset）—— 新增，跑这段即可
+--   p_all = false：只清本周（积分、每日任务、重复记录、违规记录、取消资格）
+--   p_all = true ：清掉所有周 + 所有玩家资料（测试用，全部归零）
+-- =====================================================================
+create or replace function cb_reset(p_event date, p_all boolean default false)
+returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare v_players int;
+begin
+  if p_all then
+    select count(*) into v_players from cb_users;
+    -- 每个 delete 都带 where（Supabase 的 safeupdate 不允许没有 where 的 delete）
+    delete from cb_msg_hashes  where true;
+    delete from cb_daily       where true;
+    delete from cb_violations  where true;
+    delete from cb_event_users where true;
+    delete from cb_users       where true;
+  else
+    select count(*) into v_players from cb_event_users where event_key = p_event;
+    delete from cb_msg_hashes where event_key = p_event;
+    delete from cb_daily      where event_key = p_event;
+    delete from cb_violations where event_key = p_event;
+    delete from cb_event_users where event_key = p_event;
+  end if;
+  return jsonb_build_object('players', v_players);
+end $$;
+
+revoke all on function cb_reset(date, boolean) from public, anon, authenticated;
+grant execute on function cb_reset(date, boolean) to service_role;
+
+
+-- =====================================================================
+-- 警告次数 + 禁言阶梯（新增，跑这段即可）
+-- =====================================================================
+-- 某玩家的有效警告次数（p_event 为空 = 历史全部；有值 = 只算那一周）
+create or replace function cb_warn_count(p_user bigint, p_event date default null)
+returns int
+language sql security definer set search_path = public as $$
+  select count(*)::int from cb_violations
+   where user_id = p_user and action = 'warned'
+     and (p_event is null or event_key = p_event);
+$$;
+
+-- 审核人员按「忽略」：最近一次警告不算数
+create or replace function cb_unflag(p_user bigint)
+returns void
+language sql security definer set search_path = public as $$
+  update cb_violations set action = 'ignored'
+   where id = (select id from cb_violations
+                where user_id = p_user and action = 'warned'
+                order by id desc limit 1);
+$$;
+
+-- /resetwarn：清掉某玩家全部警告次数
+create or replace function cb_clear_warns(p_user bigint)
+returns int
+language plpgsql security definer set search_path = public as $$
+declare v int;
+begin
+  update cb_violations set action = 'cleared' where user_id = p_user and action = 'warned';
+  get diagnostics v = row_count;
+  return v;
+end $$;
+
+revoke all on function cb_warn_count(bigint, date) from public, anon, authenticated;
+revoke all on function cb_unflag(bigint)            from public, anon, authenticated;
+revoke all on function cb_clear_warns(bigint)       from public, anon, authenticated;
+grant execute on function cb_warn_count(bigint, date) to service_role;
+grant execute on function cb_unflag(bigint)            to service_role;
+grant execute on function cb_clear_warns(bigint)       to service_role;
